@@ -44,6 +44,7 @@ public sealed partial class MainWindow : Window
     private Action? _syncEditorDrawerGestureHitTesting;
     private TextBox? _searchBox;
     private ListView? _libraryList;
+    private Grid? _libraryScrollTrack;
     private StackPanel? _libraryEmptyState;
     private TextBlock? _libraryEmptyTitle;
     private TextBlock? _libraryEmptyDetail;
@@ -840,12 +841,13 @@ public sealed partial class MainWindow : Window
             UpdateNotebookCardHeights();
         };
 
-        var scrollTrack = new Grid
+        var scrollTrack = _libraryScrollTrack = new Grid
         {
             Width = 12,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Stretch,
-            Background = new SolidColorBrush(Colors.Transparent)
+            Background = new SolidColorBrush(Colors.Transparent),
+            Visibility = Visibility.Collapsed
         };
         Grid.SetColumn(scrollTrack, 1);
         var trackBackground = new Border
@@ -890,14 +892,12 @@ public sealed partial class MainWindow : Window
             thumbHeight = Math.Min(trackHeight, thumbHeight);
             if (Math.Abs(scrollThumb.Height - thumbHeight) > 0.25)
                 scrollThumb.Height = thumbHeight;
-            // Keep the rail visible for every non-empty library. With 1–3 cards the orange
-            // thumb fills the complete track, communicating that the entire list is visible.
-            var thumbVisibility = _notebooks.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
-            if (scrollThumb.Visibility != thumbVisibility)
-            {
-                scrollThumb.Visibility = thumbVisibility;
-                trackBackground.Visibility = thumbVisibility;
-            }
+            // Keep the complete rail out of the visual and hit-test trees when there are no
+            // results. The list can be collapsed before its Loaded/LayoutUpdated events run,
+            // so the track starts collapsed and RefreshNotebookResultsAsync also updates it.
+            var railVisibility = _notebooks.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+            if (scrollTrack.Visibility != railVisibility)
+                scrollTrack.Visibility = railVisibility;
             var travel = Math.Max(0, trackHeight - thumbHeight);
             var top = scrollable <= 0 ? 0 : (libraryScrollViewer.VerticalOffset / scrollable) * travel;
             Canvas.SetLeft(scrollThumb, 2);
@@ -1026,6 +1026,7 @@ public sealed partial class MainWindow : Window
             _libraryList.AllowDrop = false;
         }
         if (_libraryEmptyState is not null) _libraryEmptyState.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+        if (_libraryScrollTrack is not null) _libraryScrollTrack.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
         if (_libraryEmptyTitle is not null)
             _libraryEmptyTitle.Text = _favoritesOnly && string.IsNullOrEmpty(normalized)
                 ? "No favorite notebooks yet"
