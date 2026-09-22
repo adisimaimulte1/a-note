@@ -1,0 +1,240 @@
+<Application
+    x:Class="ANote.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    RequestedTheme="Dark">
+    <Application.Resources>
+        <ResourceDictionary>
+            <Color x:Key="BackgroundColor">#070706</Color>
+            <Color x:Key="SurfaceColor">#111110</Color>
+            <Color x:Key="SurfaceRaisedColor">#181817</Color>
+            <Color x:Key="AccentColor">#FF7A18</Color>
+            <SolidColorBrush x:Key="AppBackgroundBrush" Color="{StaticResource BackgroundColor}" />
+            <SolidColorBrush x:Key="SurfaceBrush" Color="{StaticResource SurfaceColor}" />
+            <SolidColorBrush x:Key="SurfaceRaisedBrush" Color="{StaticResource SurfaceRaisedColor}" />
+            <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
+            <SolidColorBrush x:Key="PrimaryTextBrush" Color="#F4F4F2" />
+            <SolidColorBrush x:Key="SecondaryTextBrush" Color="#92928C" />
+            <SolidColorBrush x:Key="ThinBorderBrush" Color="#2D2D2A" />
+            <SolidColorBrush x:Key="ButtonBrush" Color="#141413" />
+            <SolidColorBrush x:Key="ButtonHoverBrush" Color="#1D1D1B" />
+            <SolidColorBrush x:Key="ButtonPressedBrush" Color="#252522" />
+            <SolidColorBrush x:Key="AccentHoverBrush" Color="#FF8B2C" />
+            <SolidColorBrush x:Key="AccentPressedBrush" Color="#E5680D" />
+            <SolidColorBrush x:Key="TextControlBackground" Color="#111110" />
+            <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="#111110" />
+            <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#111110" />
+            <SolidColorBrush x:Key="TextControlBorderBrush" Color="#2D2D2A" />
+            <SolidColorBrush x:Key="TextControlBorderBrushPointerOver" Color="#FF7A18" />
+            <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="#FF7A18" />
+            <SolidColorBrush x:Key="TextControlForeground" Color="#F4F4F2" />
+            <SolidColorBrush x:Key="TextControlForegroundPointerOver" Color="#F4F4F2" />
+            <SolidColorBrush x:Key="TextControlForegroundFocused" Color="#F4F4F2" />
+            <SolidColorBrush x:Key="TextControlPlaceholderForeground" Color="#92928C" />
+            <SolidColorBrush x:Key="TextControlPlaceholderForegroundPointerOver" Color="#92928C" />
+            <SolidColorBrush x:Key="TextControlPlaceholderForegroundFocused" Color="#92928C" />
+            <FontFamily x:Key="DisplayFontFamily">ms-appx:///Assets/Fonts/SpaceGrotesk-Variable.ttf#Space Grotesk</FontFamily>
+            <Style x:Key="OutlineButtonStyle" TargetType="Button">
+                <Setter Property="IsTabStop" Value="False" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="Foreground" Value="{StaticResource AccentBrush}" />
+                <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                <Setter Property="BorderThickness" Value="2" />
+                <Setter Property="CornerRadius" Value="3" />
+                <Setter Property="Padding" Value="18,10" />
+                <Setter Property="MinHeight" Value="44" />
+                <Setter Property="FontWeight" Value="ExtraBold" />
+                <Setter Property="FontSize" Value="14" />
+                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Grid x:Name="ScaleRoot" RenderTransformOrigin="0.5,0.5">
+                                <Grid.RenderTransform>
+                                    <ScaleTransform x:Name="ButtonScale" ScaleX="1" ScaleY="1" />
+                                </Grid.RenderTransform>
+                                <VisualStateManager.VisualStateGroups>
+                                    <VisualStateGroup x:Name="CommonStates">
+                                        <VisualStateGroup.Transitions>
+                                            <VisualTransition GeneratedDuration="0:0:0.10" />
+                                        </VisualStateGroup.Transitions>
+                                        <VisualState x:Name="Normal"><VisualState.Setters><Setter Target="ButtonScale.ScaleX" Value="1" /><Setter Target="ButtonScale.ScaleY" Value="1" /></VisualState.Setters></VisualState>
+                                        <VisualState x:Name="PointerOver"><VisualState.Setters><Setter Target="ButtonScale.ScaleX" Value="1.05" /><Setter Target="ButtonScale.ScaleY" Value="1.05" /></VisualState.Setters></VisualState>
+                                        <VisualState x:Name="Pressed"><VisualState.Setters><Setter Target="ButtonScale.ScaleX" Value="0.985" /><Setter Target="ButtonScale.ScaleY" Value="0.985" /></VisualState.Setters></VisualState>
+                                        <VisualState x:Name="Disabled"><VisualState.Setters><Setter Target="RootBorder.Opacity" Value="0.45" /></VisualState.Setters></VisualState>
+                                    </VisualStateGroup>
+                                </VisualStateManager.VisualStateGroups>
+                                <Border x:Name="RootBorder" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="{TemplateBinding CornerRadius}" Padding="{TemplateBinding Padding}">
+                                    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" FontWeight="{TemplateBinding FontWeight}" Margin="0,-1,0,1" />
+                                </Border>
+                            </Grid>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style x:Key="UnavailableButtonStyle" TargetType="Button">
+                <Setter Property="IsTabStop" Value="False" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="Foreground" Value="{StaticResource AccentBrush}" />
+                <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                <Setter Property="BorderThickness" Value="2" />
+                <Setter Property="CornerRadius" Value="3" />
+                <Setter Property="Padding" Value="18,10" />
+                <Setter Property="MinHeight" Value="44" />
+                <Setter Property="FontWeight" Value="ExtraBold" />
+                <Setter Property="FontSize" Value="14" />
+                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Grid RenderTransformOrigin="0.5,0.5">
+                                <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="{TemplateBinding CornerRadius}" Padding="{TemplateBinding Padding}">
+                                    <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" FontWeight="{TemplateBinding FontWeight}" Margin="0,-1,0,1" />
+                                </Border>
+                            </Grid>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style TargetType="Button" BasedOn="{StaticResource OutlineButtonStyle}" />
+            <Style x:Key="AccentButtonStyle" TargetType="Button">
+                <Setter Property="IsTabStop" Value="False" />
+                <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+                <Setter Property="Foreground" Value="#090908" />
+                <Setter Property="BorderBrush" Value="Transparent" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="CornerRadius" Value="3" />
+                <Setter Property="Padding" Value="18,10" />
+                <Setter Property="MinHeight" Value="44" />
+                <Setter Property="FontWeight" Value="ExtraBold" />
+                <Setter Property="FontSize" Value="14" />
+                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Grid x:Name="AccentScaleRoot" RenderTransformOrigin="0.5,0.5">
+                                <Grid.RenderTransform>
+                                    <ScaleTransform x:Name="AccentScale" ScaleX="1" ScaleY="1" />
+                                </Grid.RenderTransform>
+                                <VisualStateManager.VisualStateGroups>
+                                    <VisualStateGroup x:Name="CommonStates">
+                                        <VisualStateGroup.Transitions>
+                                            <VisualTransition GeneratedDuration="0:0:0.10" />
+                                        </VisualStateGroup.Transitions>
+                                        <VisualState x:Name="Normal"><VisualState.Setters><Setter Target="AccentScale.ScaleX" Value="1" /><Setter Target="AccentScale.ScaleY" Value="1" /></VisualState.Setters></VisualState>
+                                        <VisualState x:Name="PointerOver"><VisualState.Setters><Setter Target="AccentScale.ScaleX" Value="1.05" /><Setter Target="AccentScale.ScaleY" Value="1.05" /></VisualState.Setters></VisualState>
+                                        <VisualState x:Name="Pressed"><VisualState.Setters><Setter Target="AccentScale.ScaleX" Value="0.985" /><Setter Target="AccentScale.ScaleY" Value="0.985" /></VisualState.Setters></VisualState>
+                                        <VisualState x:Name="Disabled">
+                                            <VisualState.Setters>
+                                                <Setter Target="AccentScale.ScaleX" Value="1" />
+                                                <Setter Target="AccentScale.ScaleY" Value="1" />
+                                                <Setter Target="AccentRoot.Background" Value="Transparent" />
+                                                <Setter Target="AccentRoot.BorderBrush" Value="{StaticResource AccentBrush}" />
+                                                <Setter Target="AccentRoot.BorderThickness" Value="2" />
+                                                <Setter Target="AccentRoot.Opacity" Value="1" />
+                                                <Setter Target="AccentContent.Foreground" Value="{StaticResource AccentBrush}" />
+                                            </VisualState.Setters>
+                                        </VisualState>
+                                    </VisualStateGroup>
+                                </VisualStateManager.VisualStateGroups>
+                                <Border x:Name="AccentRoot" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="{TemplateBinding CornerRadius}" Padding="{TemplateBinding Padding}">
+                                    <ContentPresenter x:Name="AccentContent" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" FontWeight="{TemplateBinding FontWeight}" Foreground="{TemplateBinding Foreground}" Margin="0,-1,0,1" />
+                                </Border>
+                            </Grid>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+            <Style TargetType="TextBox">
+                <Setter Property="Background" Value="#111110" />
+                <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+                <Setter Property="BorderBrush" Value="{StaticResource ThinBorderBrush}" />
+                <Setter Property="BorderThickness" Value="2" />
+                <Setter Property="SelectionHighlightColor" Value="{StaticResource AccentBrush}" />
+                <Setter Property="CornerRadius" Value="3" />
+                <Setter Property="Padding" Value="16,0" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                <Setter Property="FontSize" Value="15" />
+                <Setter Property="ScrollViewer.HorizontalScrollMode" Value="Auto" />
+                <Setter Property="ScrollViewer.VerticalScrollMode" Value="Disabled" />
+                <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Hidden" />
+                <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Hidden" />
+                <Setter Property="ScrollViewer.IsDeferredScrollingEnabled" Value="False" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="TextBox">
+                            <Grid>
+                                <VisualStateManager.VisualStateGroups>
+                                    <VisualStateGroup x:Name="CommonStates">
+                                        <VisualState x:Name="Normal" />
+                                        <VisualState x:Name="Disabled">
+                                            <VisualState.Setters>
+                                                <Setter Target="BorderElement.Opacity" Value="0.45" />
+                                                <Setter Target="ContentElement.Opacity" Value="0.45" />
+                                                <Setter Target="PlaceholderTextContentPresenter.Opacity" Value="0.45" />
+                                            </VisualState.Setters>
+                                        </VisualState>
+                                        <VisualState x:Name="PointerOver">
+                                            <VisualState.Setters>
+                                                <Setter Target="BorderElement.Background" Value="{ThemeResource TextControlBackgroundPointerOver}" />
+                                                <Setter Target="BorderElement.BorderBrush" Value="{ThemeResource TextControlBorderBrushPointerOver}" />
+                                                <Setter Target="ContentElement.Foreground" Value="{ThemeResource TextControlForegroundPointerOver}" />
+                                                <Setter Target="PlaceholderTextContentPresenter.Foreground" Value="{ThemeResource TextControlPlaceholderForegroundPointerOver}" />
+                                            </VisualState.Setters>
+                                        </VisualState>
+                                        <VisualState x:Name="Focused">
+                                            <VisualState.Setters>
+                                                <Setter Target="BorderElement.Background" Value="{ThemeResource TextControlBackgroundFocused}" />
+                                                <Setter Target="BorderElement.BorderBrush" Value="{ThemeResource TextControlBorderBrushFocused}" />
+                                                <Setter Target="ContentElement.Foreground" Value="{ThemeResource TextControlForegroundFocused}" />
+                                                <Setter Target="PlaceholderTextContentPresenter.Foreground" Value="{ThemeResource TextControlPlaceholderForegroundFocused}" />
+                                            </VisualState.Setters>
+                                        </VisualState>
+                                    </VisualStateGroup>
+                                </VisualStateManager.VisualStateGroups>
+
+                                <Border x:Name="BorderElement"
+                                        Background="{TemplateBinding Background}"
+                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                        CornerRadius="{TemplateBinding CornerRadius}"
+                                        Control.IsTemplateFocusTarget="True" />
+
+                                <ScrollViewer x:Name="ContentElement"
+                                              Margin="{TemplateBinding BorderThickness}"
+                                              Padding="{TemplateBinding Padding}"
+                                              Foreground="{TemplateBinding Foreground}"
+                                              HorizontalAlignment="Stretch"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              HorizontalScrollMode="{TemplateBinding ScrollViewer.HorizontalScrollMode}"
+                                              HorizontalScrollBarVisibility="{TemplateBinding ScrollViewer.HorizontalScrollBarVisibility}"
+                                              VerticalScrollMode="{TemplateBinding ScrollViewer.VerticalScrollMode}"
+                                              VerticalScrollBarVisibility="{TemplateBinding ScrollViewer.VerticalScrollBarVisibility}"
+                                              IsDeferredScrollingEnabled="{TemplateBinding ScrollViewer.IsDeferredScrollingEnabled}"
+                                              IsTabStop="False"
+                                              AutomationProperties.AccessibilityView="Raw"
+                                              ZoomMode="Disabled" />
+
+                                <ContentControl x:Name="PlaceholderTextContentPresenter"
+                                                Margin="{TemplateBinding BorderThickness}"
+                                                Padding="{TemplateBinding Padding}"
+                                                Foreground="{ThemeResource TextControlPlaceholderForeground}"
+                                                HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                                VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                                                Content="{TemplateBinding PlaceholderText}"
+                                                IsHitTestVisible="False"
+                                                IsTabStop="False" />
+                            </Grid>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

@@ -1,0 +1,89 @@
+# Build output
+bin/
+obj/
+artifacts/
+publish/
+Release/
+Debug/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# VS Code
+.vscode/
+
+# NuGet / packages
+packages/
+*.nupkg
+*.snupkg
+
+# Test results
+TestResults/
+*.trx
+coverage/
+coverage.*
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.cache
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Generated installer output
+Output/
+installer/Output/
+
+# Generated app icon
+assets/logo/A-Note.ico
+
+# Generated WinUI resources
+resources.pri
+*.pri
+
+# Local publish/build folders
+src/A-Note/bin/
+src/A-Note/obj/
+
+# Local databases / runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Crash dumps
+*.dmp
+
+# Certificates / signing files
+*.pfx
+*.p12
+*.cer
+*.key
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# PowerShell local state
+*.ps1xml

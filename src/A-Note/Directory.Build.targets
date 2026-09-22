@@ -1,0 +1,30 @@
+<Project>
+  <!--
+    The project is unpackaged. These two MRT packaging targets require Visual Studio's
+    optional MSIX workload even though their output is not used by A-Note. Lightweight
+    equivalents keep command-line builds working with the .NET SDK + NuGet build tools.
+  -->
+  <Target Name="AddPriPayloadFilesToCopyToOutputDirectoryItems" />
+  <Target Name="CopyLocalFilesOutputGroup" Returns="@(CopyLocalFilesOutputGroupOutput)">
+    <ItemGroup>
+      <CopyLocalFilesOutputGroupOutput Include="@(ReferenceCopyLocalPaths)">
+        <TargetPath>%(ReferenceCopyLocalPaths.DestinationSubDirectory)%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)</TargetPath>
+      </CopyLocalFilesOutputGroupOutput>
+    </ItemGroup>
+  </Target>
+  <Target Name="GetMrtPackagingOutputs" Returns="@(PackagingOutputs)">
+    <ItemGroup>
+      <PackagingOutputs Include="@(ReferenceCopyLocalPaths)">
+        <TargetPath>%(ReferenceCopyLocalPaths.DestinationSubDirectory)%(ReferenceCopyLocalPaths.Filename)%(ReferenceCopyLocalPaths.Extension)</TargetPath>
+        <OutputGroup>CopyLocalFilesOutputGroup</OutputGroup>
+        <ProjectName>$(ProjectName)</ProjectName>
+      </PackagingOutputs>
+    </ItemGroup>
+  </Target>
+  <Target Name="_GetPackageArchitecture">
+    <PropertyGroup><PackageArchitecture>x64</PackageArchitecture></PropertyGroup>
+  </Target>
+  <Target Name="_GetDefaultResourceLanguage">
+    <PropertyGroup><DefaultResourceLanguage>en-US</DefaultResourceLanguage></PropertyGroup>
+  </Target>
+</Project>
