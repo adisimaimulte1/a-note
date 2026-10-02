@@ -1,5 +1,5 @@
 ﻿#ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "2.0.0"
 #endif
 #ifndef MyOutputDir
   #define MyOutputDir "..\artifacts\installer"
@@ -39,6 +39,9 @@ VersionInfoDescription=A-Note Setup
 VersionInfoProductName=A-Note
 VersionInfoProductVersion={#MyAppVersion}
 SetupLogging=yes
+; Upgrades reuse this stable AppId and program directory. Notebook data is deliberately
+; stored separately under %LOCALAPPDATA%\A-Note and is never part of installer cleanup.
+UsePreviousAppDir=yes
 
 [Files]
 Source: "{#MyPublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

@@ -16,6 +16,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <PublishSingleFile>false</PublishSingleFile>
     <ApplicationIcon>..\..\assets\logo\A-Note.ico</ApplicationIcon>
+    <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
+    <InformationalVersion>2.0.0</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250602001" />

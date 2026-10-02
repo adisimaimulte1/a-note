@@ -8,13 +8,40 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $solution = Join-Path $projectRoot 'A-Note.sln'
 $project = Join-Path $projectRoot 'src\A-Note\A-Note.csproj'
 $iconGenerator = Join-Path $PSScriptRoot 'Generate-AppIcon.ps1'
+$output = Join-Path $projectRoot "src\A-Note\bin\x64\$Configuration\net8.0-windows10.0.19041.0"
+$outputExe = Join-Path $output 'A-Note.exe'
+
+# An unpackaged WinUI process memory-maps resources.pri. Close only the development
+# instance built into this exact output directory before replacing build artifacts.
+if (Test-Path -LiteralPath $outputExe) {
+    $resolvedOutputExe = [System.IO.Path]::GetFullPath($outputExe)
+    foreach ($process in @(Get-Process -Name 'A-Note' -ErrorAction SilentlyContinue)) {
+        try {
+            if ([System.IO.Path]::GetFullPath($process.Path) -ne $resolvedOutputExe) { continue }
+            Write-Host "Stopping running A-Note development instance (PID $($process.Id))..."
+            $processId = $process.Id
+            try { $process.Kill() } catch {
+                if (Get-Process -Id $processId -ErrorAction SilentlyContinue) { throw }
+            }
+            try { $process.WaitForExit(5000) | Out-Null } catch { }
+            if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+                throw "A-Note PID $processId did not exit in time."
+            }
+        }
+        catch [System.ComponentModel.Win32Exception] {
+            # A process that exits between enumeration and inspection no longer holds the file.
+        }
+        catch [System.InvalidOperationException] {
+            # A process that exits between enumeration and inspection no longer holds the file.
+        }
+    }
+}
 
 & $iconGenerator
 
 dotnet build $solution -c $Configuration -p:Platform=x64
 if ($LASTEXITCODE -ne 0) { throw 'A-Note build failed.' }
 
-$output = Join-Path $projectRoot "src\A-Note\bin\x64\$Configuration\net8.0-windows10.0.19041.0"
 $sdkBinRoot = 'C:\Program Files (x86)\Windows Kits\10\bin'
 $makePri = Get-ChildItem -LiteralPath $sdkBinRoot -Filter makepri.exe -Recurse |
     Where-Object { $_.FullName -match '\\x64\\makepri\.exe$' } |

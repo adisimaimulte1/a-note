@@ -28,6 +28,7 @@ A-Note is a $\color{#D65A00}{\textsf{local-first Windows notebook}}$ built aroun
 | $\color{#D65A00}{\textsf{Flexible pages}}$    | Add, duplicate and delete blank, ruled or grid pages.                                |
 | $\color{#D65A00}{\textsf{Natural navigation}}$ | Scroll with touch, a pen-scroll tool or the page scrollbar.                          |
 | $\color{#D65A00}{\textsf{Photos}}$             | Insert, move, scale, rotate and duplicate images with their page.                    |
+| $\color{#D65A00}{\textsf{PDF export}}$         | Export an entire notebook, including handwriting and photos, as a local PDF.          |
 | $\color{#D65A00}{\textsf{Local autosave}}$     | Notebook data, ink and attachments remain on the device and save automatically.      |
 
 A-Note does not require an account and does not include cloud sync, telemetry or an online service.
@@ -101,6 +102,8 @@ Every notebook contains at least one page. Pages can be:
 - deleted after confirmation.
 
 Deleting the only remaining page clears its handwriting instead of removing the page itself.
+
+The export button in the page toolbar writes the complete notebook to a landscape PDF. Export runs locally and preserves the dark paper, page pattern, handwriting, highlighting and photos.
 
 ---
 
@@ -191,10 +194,9 @@ artifacts\installer\A-Note-Setup-<version>.exe
 
 A-Note is planned to expand with:
 
-- $\color{#D65A00}{\textsf{PDF export}}$;
 - $\color{#D65A00}{\textsf{handwriting recognition}}$ and personalized handwriting adaptation;
 - $\color{#D65A00}{\textsf{local semantic search}}$; and
-- $\color{#D65A00}{\textsf{local AI study tools}}$ for summaries, flashcards and quizzes.
+- additional $\color{#D65A00}{\textsf{local AI study tools}}$ such as flashcards and quizzes.
 
 These features are roadmap items and are not included in the current release.
 

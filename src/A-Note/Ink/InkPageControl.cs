@@ -93,8 +93,12 @@ public sealed class InkPageControl : UserControl
     private bool _photoManipulationActive;
     private readonly Point[] _photoButtonTargets = new Point[3];
     private bool _photoButtonsHavePosition;
-    private readonly Stack<InkStrokeData> _redo = new();
-    private readonly Stack<string> _sessionUndoIds = new();
+    private readonly Stack<InkEdit> _undo = new();
+    private readonly Stack<InkEdit> _redo = new();
+    private readonly Dictionary<string, Rect> _strokeBounds = [];
+    private readonly Dictionary<string, InkStrokeData> _eraseOriginals = [];
+    private readonly HashSet<string> _eraseGeneratedIds = [];
+    private DateTimeOffset _lastEraseRender = DateTimeOffset.MinValue;
     private readonly HashSet<string> _selectedIds = [];
     private InkStrokeData? _activeStroke;
     private Point _lastPoint;
@@ -128,7 +132,7 @@ public sealed class InkPageControl : UserControl
 
     public bool HasSelection => _selectedIds.Count > 0;
     public bool IsPhotoInteractionActive => _photoManipulationActive || _photoDragElement is not null || _photoTouches.Count > 0 || _photoRotating || _photoScaling;
-    public bool CanUndo => _sessionUndoIds.Any(id => Page.Strokes.Any(stroke => stroke.Id == id));
+    public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
 
     [DllImport("user32.dll")]
@@ -1069,8 +1073,9 @@ public sealed class InkPageControl : UserControl
         RenderAll();
         await Task.Yield();
         await RefreshPhotosAsync();
-        _sessionUndoIds.Clear();
+        _undo.Clear();
         _redo.Clear();
+        RebuildStrokeBounds();
         HistoryChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -1154,7 +1159,13 @@ public sealed class InkPageControl : UserControl
         _lastPoint = point.Position;
         _inkCanvas.CapturePointer(e.Pointer);
         WritingStateChanged?.Invoke(this, true);
-        if (Tool == InkTool.Eraser) EraseAt(_lastPoint);
+        if (Tool == InkTool.Eraser)
+        {
+            _eraseOriginals.Clear();
+            _eraseGeneratedIds.Clear();
+            _lastEraseRender = DateTimeOffset.MinValue;
+            EraseAt(_lastPoint);
+        }
         else if (Tool == InkTool.Lasso)
         {
             var selectionRect = _selection.Visibility == Visibility.Visible
@@ -1204,9 +1215,6 @@ public sealed class InkPageControl : UserControl
                 _activePenBucket = -1;
             }
             Page.Strokes.Add(_activeStroke);
-            _sessionUndoIds.Push(_activeStroke.Id);
-            _redo.Clear();
-            HistoryChanged?.Invoke(this, EventArgs.Empty);
         }
         e.Handled = true;
     }
@@ -1261,12 +1269,17 @@ public sealed class InkPageControl : UserControl
         _isPointerDown = false;
         // Do not restore the cursor on pen-up; the pen is usually still hovering and Windows
         // would flash its cursor between strokes. PointerExited or mouse activity restores it.
+        var completedStroke = _activeStroke;
         _activeStroke = null;
         _activeHighlightSegment = null;
         _activePenSegment = null;
         _activePenBucket = -1;
         _inkCanvas.ReleasePointerCapture(e.Pointer);
-        if (Tool == InkTool.Lasso)
+        if (Tool == InkTool.Eraser)
+        {
+            FinishEraseGesture();
+        }
+        else if (Tool == InkTool.Lasso)
         {
             if (_movingSelection)
             {
@@ -1279,6 +1292,11 @@ public sealed class InkPageControl : UserControl
         }
         else
         {
+            if (completedStroke is not null)
+            {
+                _strokeBounds[completedStroke.Id] = BoundsOf(completedStroke);
+                PushEdit(new InkEdit([], [completedStroke]));
+            }
             // Pen and highlighter both append directly into retained geometries while drawing,
             // so pen-up performs no full-page rebuild even on extremely dense pages.
             InkChanged?.Invoke(this, EventArgs.Empty);
@@ -1426,7 +1444,10 @@ public sealed class InkPageControl : UserControl
     public void DeleteSelection()
     {
         if (_selectedIds.Count == 0) return;
+        var removed = Page.Strokes.Where(s => _selectedIds.Contains(s.Id)).ToList();
         Page.Strokes.RemoveAll(s => _selectedIds.Contains(s.Id));
+        foreach (var stroke in removed) _strokeBounds.Remove(stroke.Id);
+        PushEdit(new InkEdit(removed, []));
         _selectedIds.Clear(); _selection.Visibility = Visibility.Collapsed;
         _selectionDeleteButton.Visibility = Visibility.Collapsed;
         _deleteButtonHasPosition = false;
@@ -1439,7 +1460,8 @@ public sealed class InkPageControl : UserControl
     {
         Page.Strokes.Clear();
         _redo.Clear();
-        _sessionUndoIds.Clear();
+        _undo.Clear();
+        _strokeBounds.Clear();
         _selectedIds.Clear();
         _selection.Visibility = Visibility.Collapsed;
         _selectionDeleteButton.Visibility = Visibility.Collapsed;
@@ -1456,40 +1478,170 @@ public sealed class InkPageControl : UserControl
     private void EraseAt(Point p)
     {
         var eraseHighlight = EraserTarget == InkTool.Highlighter;
-        var removed = Page.Strokes.RemoveAll(stroke =>
-            (eraseHighlight ? stroke.Tool == "highlighter" : stroke.Tool != "highlighter") &&
-            stroke.Points.Any(q => Distance(p, new Point(q.X, q.Y)) < 14));
-        if (removed > 0) { RenderAll(); InkChanged?.Invoke(this, EventArgs.Empty); HistoryChanged?.Invoke(this, EventArgs.Empty); }
+        const double radius = 14;
+        var changed = false;
+        for (var index = Page.Strokes.Count - 1; index >= 0; index--)
+        {
+            var stroke = Page.Strokes[index];
+            if ((eraseHighlight ? stroke.Tool != "highlighter" : stroke.Tool == "highlighter") || stroke.Points.Count < 2) continue;
+            if (!_strokeBounds.TryGetValue(stroke.Id, out var bounds))
+                _strokeBounds[stroke.Id] = bounds = BoundsOf(stroke);
+            if (!Expanded(bounds, radius).Contains(p)) continue;
+
+            var keep = new bool[stroke.Points.Count];
+            Array.Fill(keep, true);
+            var hit = false;
+            for (var pointIndex = 0; pointIndex < stroke.Points.Count; pointIndex++)
+            {
+                var point = stroke.Points[pointIndex];
+                if (Distance(p, new Point(point.X, point.Y)) >= radius) continue;
+                keep[pointIndex] = false;
+                hit = true;
+            }
+            // Sparse/fast pen input can leave a long segment whose endpoints are outside the
+            // eraser even though the line crosses it. Test segments as well as sampled points.
+            for (var pointIndex = 1; pointIndex < stroke.Points.Count; pointIndex++)
+            {
+                var a = stroke.Points[pointIndex - 1];
+                var b = stroke.Points[pointIndex];
+                if (DistanceToSegment(p, new Point(a.X, a.Y), new Point(b.X, b.Y)) >= radius) continue;
+                keep[pointIndex - 1] = false;
+                keep[pointIndex] = false;
+                hit = true;
+            }
+            if (!hit) continue;
+
+            if (!_eraseGeneratedIds.Contains(stroke.Id)) _eraseOriginals.TryAdd(stroke.Id, stroke);
+            _eraseGeneratedIds.Remove(stroke.Id);
+            Page.Strokes.RemoveAt(index);
+            _strokeBounds.Remove(stroke.Id);
+            var fragments = SplitStroke(stroke, keep).ToList();
+            Page.Strokes.InsertRange(index, fragments);
+            foreach (var fragment in fragments)
+            {
+                _eraseGeneratedIds.Add(fragment.Id);
+                _strokeBounds[fragment.Id] = BoundsOf(fragment);
+            }
+            changed = true;
+        }
+        if (changed && DateTimeOffset.UtcNow - _lastEraseRender >= TimeSpan.FromMilliseconds(32))
+        {
+            _lastEraseRender = DateTimeOffset.UtcNow;
+            RenderAll();
+        }
     }
 
     public void Undo()
     {
-        while (_sessionUndoIds.Count > 0)
-        {
-            var id = _sessionUndoIds.Pop();
-            var index = Page.Strokes.FindLastIndex(stroke => stroke.Id == id);
-            if (index < 0) continue;
-            var stroke = Page.Strokes[index];
-            Page.Strokes.RemoveAt(index);
-            _redo.Push(stroke);
-            RenderAll();
-            InkChanged?.Invoke(this, EventArgs.Empty);
-            HistoryChanged?.Invoke(this, EventArgs.Empty);
-            return;
-        }
+        if (_undo.Count == 0) return;
+        var edit = _undo.Pop();
+        ApplyEdit(edit, undo: true);
+        _redo.Push(edit);
+        RenderAll();
+        InkChanged?.Invoke(this, EventArgs.Empty);
         HistoryChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public void Redo()
     {
         if (_redo.Count == 0) return;
-        var stroke = _redo.Pop();
-        Page.Strokes.Add(stroke);
-        _sessionUndoIds.Push(stroke.Id);
+        var edit = _redo.Pop();
+        ApplyEdit(edit, undo: false);
+        _undo.Push(edit);
         RenderAll();
         InkChanged?.Invoke(this, EventArgs.Empty);
         HistoryChanged?.Invoke(this, EventArgs.Empty);
     }
+
+    private void FinishEraseGesture()
+    {
+        if (_eraseOriginals.Count == 0) return;
+        var added = Page.Strokes.Where(stroke => _eraseGeneratedIds.Contains(stroke.Id)).ToList();
+        PushEdit(new InkEdit(_eraseOriginals.Values.ToList(), added));
+        _eraseOriginals.Clear();
+        _eraseGeneratedIds.Clear();
+        RenderAll();
+        InkChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void PushEdit(InkEdit edit)
+    {
+        _undo.Push(edit);
+        _redo.Clear();
+        HistoryChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ApplyEdit(InkEdit edit, bool undo)
+    {
+        var remove = undo ? edit.Added : edit.Removed;
+        var add = undo ? edit.Removed : edit.Added;
+        var removeIds = remove.Select(stroke => stroke.Id).ToHashSet();
+        Page.Strokes.RemoveAll(stroke => removeIds.Contains(stroke.Id));
+        foreach (var id in removeIds) _strokeBounds.Remove(id);
+        foreach (var stroke in add)
+        {
+            Page.Strokes.Add(stroke);
+            _strokeBounds[stroke.Id] = BoundsOf(stroke);
+        }
+    }
+
+    private static IEnumerable<InkStrokeData> SplitStroke(InkStrokeData source, bool[] keep)
+    {
+        List<InkPointData>? points = null;
+        for (var index = 0; index < source.Points.Count; index++)
+        {
+            if (keep[index])
+            {
+                points ??= [];
+                points.Add(source.Points[index]);
+            }
+            else if (points is not null)
+            {
+                if (points.Count >= 2) yield return Fragment(source, points);
+                points = null;
+            }
+        }
+        if (points is { Count: >= 2 }) yield return Fragment(source, points);
+    }
+
+    private static InkStrokeData Fragment(InkStrokeData source, List<InkPointData> points) => new()
+    {
+        Tool = source.Tool,
+        Color = source.Color,
+        Width = source.Width,
+        Points = points
+    };
+
+    private void RebuildStrokeBounds()
+    {
+        _strokeBounds.Clear();
+        foreach (var stroke in Page.Strokes) _strokeBounds[stroke.Id] = BoundsOf(stroke);
+    }
+
+    private static Rect BoundsOf(InkStrokeData stroke)
+    {
+        if (stroke.Points.Count == 0) return Rect.Empty;
+        var minX = stroke.Points.Min(point => point.X);
+        var maxX = stroke.Points.Max(point => point.X);
+        var minY = stroke.Points.Min(point => point.Y);
+        var maxY = stroke.Points.Max(point => point.Y);
+        return new Rect(minX, minY, Math.Max(.1, maxX - minX), Math.Max(.1, maxY - minY));
+    }
+
+    private static Rect Expanded(Rect value, double amount) =>
+        new(value.X - amount, value.Y - amount, value.Width + amount * 2, value.Height + amount * 2);
+
+    private static double DistanceToSegment(Point point, Point start, Point end)
+    {
+        var dx = end.X - start.X;
+        var dy = end.Y - start.Y;
+        var lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared <= .001) return Distance(point, start);
+        var amount = Math.Clamp(((point.X - start.X) * dx + (point.Y - start.Y) * dy) / lengthSquared, 0, 1);
+        return Distance(point, new Point(start.X + dx * amount, start.Y + dy * amount));
+    }
+
+    private sealed record InkEdit(IReadOnlyList<InkStrokeData> Removed, IReadOnlyList<InkStrokeData> Added);
 
     private void RenderAll()
     {

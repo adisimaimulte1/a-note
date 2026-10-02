@@ -6,12 +6,14 @@ using ANote.Ink;
 using ANote.Models;
 using ANote.Services;
 using ANote.Controls;
+using ANote.Storage;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Hosting;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Animation;
 using WinRT.Interop;
@@ -26,6 +28,10 @@ public sealed partial class MainWindow : Window
 {
     private enum NotebookSortMode { Default, Alphabetical }
     private const uint WmGetMinMaxInfo = 0x0024;
+    private const uint WmClose = 0x0010;
+    private const uint WmSysCommand = 0x0112;
+    private const long ScMinimize = 0xF020;
+    private const long ScClose = 0xF060;
     private const int MinimumWindowWidth = 1000;
     private const int MinimumWindowHeight = 640;
     private readonly DatabaseService _db = new();
@@ -33,15 +39,22 @@ public sealed partial class MainWindow : Window
     private Notebook? _currentNotebook;
     private ListView? _pageList;
     private readonly ObservableCollection<PageView> _pageViews = [];
+    private double _pageViewportHeight;
     private Border? _floatingToolbar;
     private Button? _pageTypeButton;
     private Button? _undoButton;
     private Button? _redoButton;
     private Button? _scrollToolButton;
+    private Button? _exportButton;
+    private Button? _windowLockButton;
+    private Grid? _editorLoadingOverlay;
+    private Microsoft.UI.Composition.Visual? _editorLoadingSpinnerVisual;
     private bool _penScrollMode;
+    private bool _windowInteractionLocked;
     private Action? _toggleEditorDrawer;
     private Action? _hideEditorDrawer;
     private Action? _syncEditorDrawerGestureHitTesting;
+    private Action? _syncPageScrollMode;
     private TextBox? _searchBox;
     private ListView? _libraryList;
     private Grid? _libraryScrollTrack;
@@ -73,6 +86,28 @@ public sealed partial class MainWindow : Window
     private List<UIElement>? _pendingInitialEntranceStages;
     private DateTimeOffset _lastPenActivity = DateTimeOffset.MinValue;
     private string _editorAccent = "#FF7A18";
+    private Action? _syncPageScrollThumb;
+    private int _notebookOpenRevision;
+    private static readonly object OpenTraceGate = new();
+
+    private static void TraceNotebookOpen(string message, bool reset = false)
+    {
+        try
+        {
+            AppPaths.EnsureCreated();
+            var path = Path.Combine(AppPaths.Root, "open-trace.log");
+            var line = $"{DateTimeOffset.Now:O} [thread {Environment.CurrentManagedThreadId}] {message}{Environment.NewLine}";
+            lock (OpenTraceGate)
+            {
+                using var stream = new FileStream(path, reset ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.Read);
+                using var writer = new StreamWriter(stream);
+                writer.Write(line);
+                writer.Flush();
+                stream.Flush(true);
+            }
+        }
+        catch { }
+    }
 
     public MainWindow()
     {
@@ -128,6 +163,34 @@ public sealed partial class MainWindow : Window
         var current = MainContent.Content as UIElement;
         var firstPresentation = current is null;
 
+        if (!firstPresentation && !animateExisting)
+        {
+            // Never remove the clicked notebook card/ListView synchronously from inside its
+            // routed Click event. WinUI protects that dispatch against re-entrancy and fail-fasts
+            // with a stowed 0xC000027B exception when the event source is torn down mid-dispatch.
+            // A normal dispatcher turn is visually immediate but lets WinUI finish every
+            // high-priority input/template callback associated with the button first.
+            var swapped = new TaskCompletionSource<bool>();
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                TraceNotebookOpen("dispatcher swap: begin");
+                if (current is not null)
+                {
+                    foreach (var progressRing in Descendants<ProgressRing>(current))
+                        progressRing.IsActive = false;
+                }
+                MainContent.Content = next;
+                next.Opacity = 1;
+                TraceNotebookOpen("dispatcher swap: complete");
+                swapped.TrySetResult(true);
+            }))
+            {
+                swapped.TrySetException(new InvalidOperationException("The editor could not be queued on the UI thread."));
+            }
+            await swapped.Task;
+            return;
+        }
+
         if (!firstPresentation && animateExisting && current is not null)
         {
             var exitX = forward ? -18d : 18d;
@@ -176,12 +239,6 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        if (!animateExisting)
-        {
-            next.Opacity = 1;
-            return;
-        }
-
         var enterX = forward ? 22d : -22d;
         await AnimateElementAsync(next, 0, 1, enterX, 0, 0, 0, 220);
     }
@@ -199,12 +256,56 @@ public sealed partial class MainWindow : Window
             if (File.Exists(iconPath)) _appWindow.SetIcon(iconPath);
         }
         catch { }
-        await _db.InitializeAsync();
-        await LoadSettingsAsync();
-        RestoreWindow();
-        // Always start on the notebook library. LastNotebookId is still kept for compatibility,
-        // but startup intentionally never resumes directly into an editor.
-        await ShowLibraryAsync();
+        try
+        {
+            await _db.InitializeAsync();
+            await LoadSettingsAsync();
+            RestoreWindow();
+            // Always start on the notebook library. LastNotebookId is still kept for compatibility,
+            // but startup intentionally never resumes directly into an editor.
+            await ShowLibraryAsync();
+        }
+        catch (Exception exception)
+        {
+            ShowStartupFailure(exception);
+        }
+    }
+
+    private void ShowStartupFailure(Exception exception)
+    {
+        TitleContext.Text = "STARTUP ERROR";
+        var details = new StackPanel
+        {
+            Spacing = 12,
+            MaxWidth = 620,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        details.Children.Add(new TextBlock
+        {
+            Text = "A-NOTE COULDN'T LOAD YOUR LIBRARY",
+            FontFamily = (FontFamily)Application.Current.Resources["DisplayFontFamily"],
+            FontSize = 24,
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+            TextAlignment = TextAlignment.Center
+        });
+        details.Children.Add(new TextBlock
+        {
+            Text = exception.Message,
+            Foreground = Brush("#92928C"),
+            FontSize = 14,
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center
+        });
+        details.Children.Add(new TextBlock
+        {
+            Text = $"Recovery files are kept in {AppPaths.DatabaseRecoveryDirectory}",
+            Foreground = Brush(_editorAccent),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center
+        });
+        MainContent.Content = details;
     }
 
     private async Task LoadSettingsAsync()
@@ -238,6 +339,8 @@ public sealed partial class MainWindow : Window
 
     private async Task ShowLibraryAsync(string? search = null)
     {
+        ++_notebookOpenRevision;
+        SetWindowInteractionLocked(false);
         var returningFromEditor = _currentNotebook is not null;
         await FlushPagesAsync();
         _currentNotebook = null;
@@ -775,6 +878,12 @@ public sealed partial class MainWindow : Window
         createButton.Height = 52;
         createButton.Width = 220;
         createButton.HorizontalAlignment = HorizontalAlignment.Stretch;
+        // Set the initial accent values explicitly so the first composed frame already has
+        // the final colors before the entrance animation begins.
+        createButton.Background = Brush("#FF7A18");
+        createButton.Foreground = Brush("#090908");
+        createButton.BorderBrush = new SolidColorBrush(Colors.Transparent);
+        createButton.BorderThickness = new Thickness(0);
         Grid.SetColumn(createButton, 2); actions.Children.Add(createButton);
         header.Children.Add(actions); root.Children.Add(header);
 
@@ -978,13 +1087,16 @@ public sealed partial class MainWindow : Window
 
         outer.Children.Add(root);
 
-        // On a cold launch, reveal the library in deliberate stages instead of fading the
-        // complete screen as one slab. Load the data first so notebook cards participate
-        // in the final stage instead of popping in after the animation finishes.
-        if (MainContent.Content is null && !_initialEntrancePlayed)
-            _pendingInitialEntranceStages = [heading, actions, listHost];
-
         await RefreshNotebookResultsAsync(_searchQuery);
+        // Choose the visible result surface only after data is loaded. Previously listHost was
+        // staged unconditionally, leaving the empty-state copy visible from frame one.
+        if (MainContent.Content is null && !_initialEntrancePlayed)
+            _pendingInitialEntranceStages =
+            [
+                heading,
+                actions,
+                _libraryEmptyState?.Visibility == Visibility.Visible ? _libraryEmptyState : listHost
+            ];
         await SetMainContentAnimatedAsync(outer, forward: false, animateExisting: returningFromEditor);
     }
 
@@ -1449,7 +1561,34 @@ public sealed partial class MainWindow : Window
             ?? button.DataContext as Notebook;
         if (notebook is null) return;
 
-        await ExecuteNotebookActionAsync(button, notebook, action);
+        if (action == "open") TraceNotebookOpen("Open button Click: entered", reset: true);
+
+        try
+        {
+            await ExecuteNotebookActionAsync(button, notebook, action);
+        }
+        catch (Exception exception)
+        {
+            // Routed event handlers are async void at the WinUI boundary. Observe every failure
+            // here so malformed page data or an I/O error cannot terminate the whole process.
+            try
+            {
+                AppPaths.EnsureCreated();
+                await File.WriteAllTextAsync(Path.Combine(AppPaths.Root, "last-open-error.txt"), exception.ToString());
+            }
+            catch { }
+
+            var message = new TextBlock
+            {
+                Text = "This notebook could not be opened. Your pages were not changed.",
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = Brush("#C7C7C1")
+            };
+            var dialog = Dialog("Couldn't open notebook", message, "", compact: true);
+            dialog.PrimaryButtonText = "";
+            dialog.CloseButtonText = "Close";
+            await ShowCenteredDialogAsync(dialog);
+        }
     }
 
     private void QueueFavoriteSave(Notebook notebook)
@@ -1651,8 +1790,9 @@ public sealed partial class MainWindow : Window
 
     private async Task OpenNotebookAsync(Notebook notebook)
     {
-        // Every notebook starts from a predictable input state. Tool choices are deliberately
-        // per-open-session rather than leaking from whichever notebook was used previously.
+        TraceNotebookOpen("OpenNotebookAsync: entered");
+        var openRevision = ++_notebookOpenRevision;
+
         _tool = InkTool.Pen;
         _eraseTarget = InkTool.Pen;
         _eraserEnabled = false;
@@ -1665,33 +1805,149 @@ public sealed partial class MainWindow : Window
         TitleContext.Foreground = Brush(_editorAccent);
         if (TitleBarDragTarget.Children.OfType<Border>().FirstOrDefault() is Border editorBrandSquare)
             editorBrandSquare.Background = Brush(_editorAccent);
+
         _pageViews.Clear();
         _activeInk = null;
         _pageTypeButton = null;
-        // Show the editor from page metadata first. Ink is read only for realized pages;
-        // deserializing every page before navigation made large notebooks feel frozen.
+
+        // Replace the clicked library card on the next dispatcher turn before doing any page
+        // construction. Removing that card synchronously from its own routed Click used to make
+        // WinUI fail-fast inside Microsoft.UI.Xaml.dll. This lightweight surface also gives the
+        // compositor a real ProgressRing to present while the notebook is prepared.
+        await SetMainContentAnimatedAsync(BuildNotebookLoadingView(), forward: true, animateExisting: false);
+        TraceNotebookOpen("loading surface presented");
+        await Task.Yield();
+
+        // Keep the opening path identical to the stable GitHub build: load only page metadata,
+        // build each page's XAML tree before it enters ListView, then present the editor.
+        TraceNotebookOpen("page metadata query: begin");
         var pages = await _db.GetPagesAsync(notebook.Id, loadInk: false);
+        TraceNotebookOpen($"page metadata query: complete ({pages.Count} pages)");
+        if (openRevision != _notebookOpenRevision || _currentNotebook?.Id != notebook.Id) return;
+
         if (pages.Count == 0)
         {
             var first = new NotePage { NotebookId = notebook.Id, SortOrder = 0 };
-            await _db.SavePageAsync(first); pages.Add(first);
+            await _db.SavePageAsync(first);
+            pages.Add(first);
         }
+
+        var migratedPages = new List<NotePage>();
         foreach (var page in pages)
         {
-            // Dotted paper was removed from the UI. Existing dotted pages are migrated to Blank
-            // so old notebooks never surface an orphaned paper style label.
             if (page.PaperStyle == PaperStyle.Dotted)
             {
                 page.PaperStyle = PaperStyle.Blank;
-                await _db.SavePageAsync(page, saveInk: false);
+                migratedPages.Add(page);
             }
+
             _pageViews.Add(CreatePageView(page, inkLoaded: false));
+            // Page controls are intentionally created on the UI apartment. Yield between them so
+            // the loading ring continues animating for notebooks with many pages.
+            await Task.Yield();
         }
-        await SetMainContentAnimatedAsync(BuildEditor(), forward: true);
-        // The full title bar is a Windows drag region in the library. In the editor only
-        // the small brand is draggable; the central top strip can receive touch gestures.
+
+        TraceNotebookOpen("BuildEditor: begin");
+        var editor = BuildEditor();
+        TraceNotebookOpen("BuildEditor: complete");
+        // The library button is no longer in the visual tree, so swapping the temporary loading
+        // surface for the editor cannot tear down the active routed-event source.
+        await SetMainContentAnimatedAsync(editor, forward: true, animateExisting: false);
+        TraceNotebookOpen("editor swap awaited");
+
+        TraceNotebookOpen("SetTitleBar: begin");
         SetTitleBar(TitleBarDragTarget);
+        TraceNotebookOpen("SetTitleBar: complete");
         TitleBarGestureTarget.Visibility = Visibility.Visible;
+        TraceNotebookOpen("title-bar gesture target visible");
+
+        if (_pageViews.Count > 0)
+        {
+            _activeInk = _pageViews[0].Ink;
+            if (_pageTypeButton is not null) _pageTypeButton.Content = _pageViews[0].Page.PaperStyle.ToString();
+            RefreshHistoryActions();
+        }
+
+        // Do not force unrealized pages to render just to dismiss the loading overlay.
+        // PageView already loads the first visible page from its normal Loaded callback;
+        // ContentReady fires after that page has finished loading ink/photos and refreshing.
+        // This keeps ListView virtualization intact and avoids touching XAML controls before
+        // WinUI has attached them to the visual tree.
+        if (_pageViews.Count == 0)
+        {
+            HideEditorLoadingOverlay();
+        }
+        else
+        {
+            var firstPage = _pageViews[0];
+            if (firstPage.IsPresented)
+            {
+                HideEditorLoadingOverlay();
+            }
+            else
+            {
+                EventHandler? readyHandler = null;
+                readyHandler = (_, _) =>
+                {
+                    firstPage.Presented -= readyHandler;
+                    if (openRevision == _notebookOpenRevision && _currentNotebook?.Id == notebook.Id)
+                        HideEditorLoadingOverlay();
+                };
+                firstPage.Presented += readyHandler;
+            }
+        }
+
+        if (migratedPages.Count > 0) _ = SaveMigratedPaperStylesAsync(migratedPages);
+    }
+
+    private void HideEditorLoadingOverlay()
+    {
+        if (_editorLoadingOverlay is null) return;
+        _editorLoadingSpinnerVisual?.StopAnimation(nameof(Microsoft.UI.Composition.Visual.RotationAngleInDegrees));
+        _editorLoadingSpinnerVisual = null;
+        foreach (var progressRing in Descendants<ProgressRing>(_editorLoadingOverlay))
+            progressRing.IsActive = false;
+        _editorLoadingOverlay.Visibility = Visibility.Collapsed;
+        _editorLoadingOverlay.IsHitTestVisible = false;
+    }
+
+    private UIElement BuildNotebookLoadingView()
+    {
+        var panel = new StackPanel
+        {
+            Spacing = 12,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        panel.Children.Add(new ProgressRing
+        {
+            Width = 38,
+            Height = 38,
+            IsActive = true,
+            Foreground = Brush(_editorAccent)
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Loading notebook…",
+            Foreground = Brush("#92928C"),
+            FontSize = 13,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Center
+        });
+        var root = new Grid { Background = Brush("#070706") };
+        root.Loaded += (_, _) => TraceNotebookOpen("editor root Loaded");
+        root.Unloaded += (_, _) => TraceNotebookOpen("editor root Unloaded");
+        root.Children.Add(panel);
+        return root;
+    }
+
+    private async Task SaveMigratedPaperStylesAsync(IReadOnlyList<NotePage> pages)
+    {
+        try
+        {
+            foreach (var page in pages) await _db.SavePageAsync(page, saveInk: false);
+        }
+        catch { /* Migration is best-effort and must never delay opening a notebook. */ }
     }
 
     private UIElement BuildEditor()
@@ -1778,6 +2034,8 @@ public sealed partial class MainWindow : Window
             if (double.IsNaN(Canvas.GetTop(scrollThumb)) || Math.Abs(Canvas.GetTop(scrollThumb) - top) > 0.25)
                 Canvas.SetTop(scrollThumb, top);
         }
+        _syncPageScrollThumb = SyncPageScrollThumb;
+        _syncPageScrollMode = null;
         _pageList.Loaded += (_, _) =>
         {
             pageScrollViewer = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
@@ -1786,8 +2044,9 @@ public sealed partial class MainWindow : Window
             {
                 if (_pageViews.Count == 0) return;
                 var index = Math.Clamp((int)Math.Round(pageScrollViewer.VerticalOffset / Math.Max(1, pageScrollViewer.ViewportHeight)), 0, _pageViews.Count - 1);
-                _activeInk = _pageViews[index].Ink;
-                if (_pageTypeButton is not null) _pageTypeButton.Content = _activeInk.Page.PaperStyle.ToString();
+                var activeView = _pageViews[index];
+                _activeInk = activeView.Ink;
+                if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
                 RefreshHistoryActions();
                 SyncPageScrollThumb();
             };
@@ -1924,8 +2183,9 @@ public sealed partial class MainWindow : Window
         _pageList.SizeChanged += (_, e) =>
         {
             if (e.NewSize.Height <= 0) return;
+            _pageViewportHeight = e.NewSize.Height;
             foreach (var page in _pageViews)
-                if (page.Root is FrameworkElement element) element.Height = e.NewSize.Height;
+                page.SetRealizedHeight(e.NewSize.Height);
         };
 
         // The page chrome is fully retracted when idle. A wide, invisible top-edge gesture
@@ -2307,8 +2567,9 @@ public sealed partial class MainWindow : Window
                 // Animate the viewport there so repeated deletes feel continuous instead of jumping.
                 var nextIndex = Math.Clamp(deletedIndex - 1, 0, _pageViews.Count - 1);
                 var nextView = _pageViews[nextIndex];
+                await nextView.EnsureInkLoadedAsync();
                 _activeInk = nextView.Ink;
-                if (_pageTypeButton is not null) _pageTypeButton.Content = _activeInk.Page.PaperStyle.ToString();
+                if (_pageTypeButton is not null) _pageTypeButton.Content = nextView.Page.PaperStyle.ToString();
                 await AnimatePageDeleteReplacementAsync(nextView);
             }
             // Keep the page controls visible after a delete so several pages can be removed
@@ -2317,6 +2578,35 @@ public sealed partial class MainWindow : Window
             drawerIdleTimer.Stop();
             drawerIdleTimer.Start();
         }));
+        _exportButton = IconPageButton("\uE72D", "Export notebook as PDF", async (_, _) =>
+        {
+            drawerIdleTimer.Stop();
+            var button = _exportButton;
+            if (button is null || !button.IsEnabled) return;
+            // Do not replace the clicked button's Content while WinUI is dispatching Click.
+            // That re-enters its control template and can cause a native XAML fail-fast.
+            if (!DispatcherQueue.TryEnqueue(async () =>
+            {
+                button.IsEnabled = false;
+                try
+                {
+                    await ExportNotebookPdfAsync();
+                }
+                catch (Exception exception)
+                {
+                    TraceNotebookOpen($"PDF export failed before its progress dialog: {exception}");
+                    await ShowExportErrorAsync(exception);
+                }
+                finally
+                {
+                    button.IsEnabled = true;
+                    SetDrawerOpen(true, animate: false);
+                    drawerIdleTimer.Start();
+                }
+            })) drawerIdleTimer.Start();
+            await Task.CompletedTask;
+        });
+        actions.Children.Add(_exportButton);
         var newPage = ActionButton("✚  New page", async (_, _) =>
         {
             var view = await AddPageAsync();
@@ -2554,36 +2844,102 @@ public sealed partial class MainWindow : Window
 
         _floatingToolbar = BuildToolbar();
         root.Children.Add(_floatingToolbar);
+
+        // Use a lightweight accent-colored arc instead of ProgressRing. A second active native
+        // ProgressRing in this incoming tree can make WinUI fail-fast while the previous loading
+        // view is detached.
+        var loadingPanel = new StackPanel
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var spinner = new Microsoft.UI.Xaml.Shapes.Path
+        {
+            Width = 40,
+            Height = 40,
+            Stroke = editorAccent,
+            StrokeThickness = 4,
+            StrokeStartLineCap = PenLineCap.Round,
+            StrokeEndLineCap = PenLineCap.Round,
+            IsHitTestVisible = false,
+            Data = new PathGeometry
+            {
+                Figures =
+                {
+                    new PathFigure
+                    {
+                        StartPoint = new Windows.Foundation.Point(20, 3),
+                        Segments =
+                        {
+                            new ArcSegment
+                            {
+                                Point = new Windows.Foundation.Point(5.3, 28.5),
+                                Size = new Windows.Foundation.Size(17, 17),
+                                IsLargeArc = true,
+                                SweepDirection = SweepDirection.Clockwise
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        loadingPanel.Children.Add(spinner);
+        var animationsEnabled = new Windows.UI.ViewManagement.UISettings().AnimationsEnabled;
+        if (animationsEnabled)
+        {
+            _editorLoadingSpinnerVisual = ElementCompositionPreview.GetElementVisual(spinner);
+            _editorLoadingSpinnerVisual.CenterPoint = new Vector3(20, 20, 0);
+            var rotation = _editorLoadingSpinnerVisual.Compositor.CreateScalarKeyFrameAnimation();
+            rotation.InsertKeyFrame(1, 360);
+            rotation.Duration = TimeSpan.FromMilliseconds(850);
+            rotation.IterationBehavior = Microsoft.UI.Composition.AnimationIterationBehavior.Forever;
+            _editorLoadingSpinnerVisual.StartAnimation(nameof(Microsoft.UI.Composition.Visual.RotationAngleInDegrees), rotation);
+        }
+        _editorLoadingOverlay = new Grid
+        {
+            Background = Brush("#070706"),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            IsHitTestVisible = true
+        };
+        _editorLoadingOverlay.Children.Add(loadingPanel);
+        _editorLoadingOverlay.Unloaded += (_, _) =>
+            _editorLoadingSpinnerVisual?.StopAnimation(nameof(Microsoft.UI.Composition.Visual.RotationAngleInDegrees));
+        root.Children.Add(_editorLoadingOverlay);
         return root;
     }
 
     private Border BuildToolbar()
     {
         var tools = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5 };
-        tools.Children.Add(ToolButton("\uED63", "Pen", InkTool.Pen));
-        tools.Children.Add(ToolButton("\uE7E6", "Highlighter", InkTool.Highlighter));
+        tools.Children.Add(ToolButton("\uED63", "Pen", InkTool.Pen, iconOffsetY: 1f));
+        tools.Children.Add(ToolButton("\uE7E6", "Highlighter", InkTool.Highlighter, iconOffsetY: 1f));
         tools.Children.Add(EraserToggleButton("\uED60", "Eraser", iconOffsetY: 1.1f));
         tools.Children.Add(ToolButton("\uF407", "Select", InkTool.Lasso, iconOffsetY: 0.9f));
         _scrollToolButton = ScrollToolButton("\uECE9", "Scroll with pen", iconOffsetX: 0f, iconOffsetY: 0.9f);
         tools.Children.Add(_scrollToolButton);
-        var addPhotoButton = IconToolAction("\uEB9F", "Add photo", async (_, _) => await AddPhotoToActivePageAsync());
+        var addPhotoButton = IconToolAction("\uEB9F", "Add photo", async (_, _) => await AddPhotoToActivePageAsync(), iconOffsetY: 1f);
         addPhotoButton.Style = (Style)Application.Current.Resources["OutlineButtonStyle"];
         addPhotoButton.Background = Brush("#00111110");
         addPhotoButton.Foreground = Brush(_editorAccent);
         addPhotoButton.BorderBrush = Brush(_editorAccent);
         addPhotoButton.BorderThickness = new Thickness(2);
         tools.Children.Add(addPhotoButton);
+        _windowLockButton = IconToolAction("\uE72E", "Lock window controls", (_, _) =>
+            SetWindowInteractionLocked(!_windowInteractionLocked), iconOffsetY: 1f);
+        ApplyWindowLockButtonVisual();
+        tools.Children.Add(_windowLockButton);
 
         _undoButton = IconToolAction("\uE7A7", "Undo", (_, _) =>
         {
             if (_activeInk?.CanUndo == true) _activeInk.Undo();
             RefreshHistoryActions();
-        });
+        }, iconOffsetY: 1f);
         _redoButton = IconToolAction("\uE7A6", "Redo", (_, _) =>
         {
             if (_activeInk?.CanRedo == true) _activeInk.Redo();
             RefreshHistoryActions();
-        });
+        }, iconOffsetY: 1f);
         tools.Children.Add(_undoButton);
         tools.Children.Add(_redoButton);
         RefreshHistoryActions();
@@ -2602,20 +2958,10 @@ public sealed partial class MainWindow : Window
             Translation = new System.Numerics.Vector3(0, 0, 24)
         };
 
-        Button IconToolAction(string glyph, string label, RoutedEventHandler action, bool accent = false)
+        Button IconToolAction(string glyph, string label, RoutedEventHandler action, bool accent = false, float iconOffsetY = -0.5f)
         {
-            var icon = new FontIcon
-            {
-                Glyph = glyph,
-                FontSize = 17,
-                FontFamily = new FontFamily("Segoe Fluent Icons"),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            var iconHost = new Grid { Width = 24, Height = 24, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-            iconHost.Children.Add(icon);
             var button = ActionButton("", action, accent);
-            button.Content = iconHost;
+            button.Content = CenteredToolIcon(glyph, iconOffsetY);
             button.Width = 38;
             button.Height = 36;
             button.MinHeight = 0;
@@ -2625,6 +2971,34 @@ public sealed partial class MainWindow : Window
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, label);
             return button;
         }
+    }
+
+    private void SetWindowInteractionLocked(bool locked)
+    {
+        _windowInteractionLocked = locked;
+        if (_appWindow?.Presenter is OverlappedPresenter presenter)
+            presenter.IsMinimizable = !locked;
+        ApplyWindowLockButtonVisual();
+    }
+
+    private void ApplyWindowLockButtonVisual()
+    {
+        if (_windowLockButton is null) return;
+        _windowLockButton.Style = (Style)Application.Current.Resources[_windowInteractionLocked ? "AccentButtonStyle" : "OutlineButtonStyle"];
+        _windowLockButton.Background = _windowInteractionLocked ? Brush(_editorAccent) : Brush("#00111110");
+        _windowLockButton.Foreground = _windowInteractionLocked ? Brush("#070706") : Brush(_editorAccent);
+        _windowLockButton.BorderBrush = Brush(_editorAccent);
+        _windowLockButton.BorderThickness = _windowInteractionLocked ? new Thickness(0) : new Thickness(2);
+        _windowLockButton.Content = CenteredToolIcon(_windowInteractionLocked ? "\uE785" : "\uE72E", 1f);
+        var label = _windowInteractionLocked ? "Unlock window controls" : "Lock window controls";
+        ToolTipService.SetToolTip(_windowLockButton, label);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(_windowLockButton, label);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetItemStatus(
+            _windowLockButton,
+            _windowInteractionLocked ? "Locked" : "Unlocked");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(
+            _windowLockButton,
+            _windowInteractionLocked ? "Close and minimize are blocked." : "Close and minimize are available.");
     }
 
     private void RefreshToolButtonVisuals()
@@ -2790,7 +3164,7 @@ public sealed partial class MainWindow : Window
         return host;
     }
 
-    private PageView CreatePageView(NotePage page, bool inkLoaded = true)
+    private InkPageControl CreateInkControl(NotePage page)
     {
         var ink = new InkPageControl(page)
         {
@@ -2799,7 +3173,6 @@ public sealed partial class MainWindow : Window
             HighlighterColor = _editorAccent,
             EraserTarget = _eraseTarget
         };
-        _activeInk ??= ink;
         ink.SetAccentColor(_editorAccent);
         ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
         ink.InkChanged += (_, _) => { ink.TagAsDirty(); _activeInk = ink; };
@@ -2825,8 +3198,18 @@ public sealed partial class MainWindow : Window
             RefreshHistoryActions();
             if (_pageTypeButton is not null) _pageTypeButton.Content = ink.Page.PaperStyle.ToString();
         }), true);
-        var viewbox = new Viewbox { Child = ink, Stretch = Stretch.Fill, HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
-        var scaled = new Border { Child = viewbox, Background = Brush("#0A0A09"), BorderBrush = Brush("#282825"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(2) };
+        return ink;
+    }
+
+    private PageView CreatePageView(NotePage page, bool inkLoaded = true)
+        => new(page, inkLoaded, CreateInkControl, CreatePageVisual);
+
+    private (Viewbox Viewbox, Border ScaleBorder, UIElement Root, TextBlock PageNumber) CreatePageVisual(PageView view)
+    {
+        var page = view.Page;
+        TraceNotebookOpen($"page {page.SortOrder + 1}: visual realization begin");
+        var viewbox = new Viewbox { Stretch = Stretch.Fill, HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
+        var scaled = new Border { Child = viewbox, Background = Brush("#0A0A09"), BorderBrush = Brush("#282825"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(2), Opacity = 0 };
         // Cache the composed page as a texture. Filled pages otherwise force WinUI to re-rasterize
         // hundreds/thousands of vector stroke segments every frame while the notebook scrolls.
         // The cache is invalidated automatically when ink changes, but scrolling becomes a cheap
@@ -2834,7 +3217,7 @@ public sealed partial class MainWindow : Window
         scaled.CacheMode = new BitmapCache();
         // A page occupies exactly one viewport. The PAGE x label is an overlay rather than
         // an extra row, so it never extends the scroll extent beyond the physical page.
-        var pageRoot = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
+        var pageRoot = (Grid)view.Root;
         pageRoot.Children.Add(scaled);
         var pageNumber = new TextBlock
         {
@@ -2854,23 +3237,50 @@ public sealed partial class MainWindow : Window
         var paperResizeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
         double paperWidth = 0;
         double paperHeight = 0;
+        bool hasFinalMetrics = false;
+        bool revealStarted = false;
+        async Task RevealWhenReadyAsync()
+        {
+            if (!hasFinalMetrics || !view.LoadAttemptCompleted || revealStarted) return;
+            revealStarted = true;
+            await AnimateElementAsync(scaled, 0, 1, 0, 0, 0, 0, 120);
+            view.NotifyPresented();
+        }
         scaled.SizeChanged += (_, e) =>
         {
             paperWidth = e.NewSize.Width;
             paperHeight = e.NewSize.Height;
+            if (!hasFinalMetrics && view.Ink is { } firstInk && paperWidth > 0 && paperHeight > 0)
+            {
+                ApplyPhysicalPaperMetrics(firstInk, paperWidth, paperHeight);
+                hasFinalMetrics = true;
+                _ = RevealWhenReadyAsync();
+                return;
+            }
             paperResizeTimer.Stop();
             paperResizeTimer.Start();
         };
         paperResizeTimer.Tick += (_, _) =>
         {
             paperResizeTimer.Stop();
-            ApplyPhysicalPaperMetrics(ink, paperWidth, paperHeight);
+            if (view.Ink is { } ink) ApplyPhysicalPaperMetrics(ink, paperWidth, paperHeight);
+            hasFinalMetrics = paperWidth > 0 && paperHeight > 0;
+            _ = RevealWhenReadyAsync();
         };
         pageRoot.Unloaded += (_, _) => paperResizeTimer.Stop();
-        var view = new PageView(page, ink, scaled, pageRoot, pageNumber, inkLoaded);
-        pageRoot.Loaded += async (_, _) => await view.EnsureInkLoadedAsync();
-        ink.RegisterDirty(view.Dirty);
-        return view;
+        view.ContentReady += (_, _) =>
+        {
+            if (!hasFinalMetrics && view.Ink is { } ink && scaled.ActualWidth > 0 && scaled.ActualHeight > 0)
+            {
+                paperWidth = scaled.ActualWidth;
+                paperHeight = scaled.ActualHeight;
+                ApplyPhysicalPaperMetrics(ink, paperWidth, paperHeight);
+                hasFinalMetrics = true;
+            }
+            _ = RevealWhenReadyAsync();
+        };
+        TraceNotebookOpen($"page {page.SortOrder + 1}: visual realization complete");
+        return (viewbox, scaled, pageRoot, pageNumber);
     }
 
     private void ApplyPhysicalPaperMetrics(InkPageControl ink, double renderedWidth, double renderedHeight)
@@ -2938,13 +3348,166 @@ public sealed partial class MainWindow : Window
     private async Task<PageView?> AddPageAsync()
     {
         if (_currentNotebook is null) return null;
-        var page = new NotePage { NotebookId = _currentNotebook.Id, SortOrder = _pageViews.Count };
+        var inheritedPaperStyle = _pageViews.LastOrDefault()?.Page.PaperStyle ?? PaperStyle.Ruled;
+        var page = new NotePage
+        {
+            NotebookId = _currentNotebook.Id,
+            SortOrder = _pageViews.Count,
+            PaperStyle = inheritedPaperStyle
+        };
         await _db.SavePageAsync(page);
         var view = CreatePageView(page);
         if (view.Root is FrameworkElement element && _pageList is { ActualHeight: > 0 }) element.Height = _pageList.ActualHeight;
         _pageViews.Add(view);
+        await view.EnsureInkLoadedAsync();
+        _activeInk = view.Ink;
+        if (_pageTypeButton is not null) _pageTypeButton.Content = inheritedPaperStyle.ToString();
         ScrollToPage(view);
         return view;
+    }
+
+    private async Task ExportNotebookPdfAsync()
+    {
+        if (_currentNotebook is null || _pageViews.Count == 0) return;
+        var picker = new FileSavePicker
+        {
+            SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+            SuggestedFileName = FormatPdfFileName(_currentNotebook.Title)
+        };
+        picker.FileTypeChoices.Add("PDF document", [".pdf"]);
+        InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+        var file = await picker.PickSaveFileAsync();
+        if (file is null) return;
+
+        var previousTitle = TitleContext.Text;
+        var previousExportContent = _exportButton?.Content;
+        if (_exportButton is not null)
+        {
+            _exportButton.IsEnabled = false;
+            _exportButton.Content = new FontIcon
+            {
+                Glyph = "\uE895",
+                FontFamily = new FontFamily("Segoe Fluent Icons"),
+                FontSize = 16
+            };
+            ToolTipService.SetToolTip(_exportButton, "Exporting PDF…");
+        }
+        MainContent.IsHitTestVisible = false;
+        TitleContext.Text = "EXPORTING PDF…";
+
+        Exception? exportFailure = null;
+        try
+        {
+            var exportPages = new NotePage[_pageViews.Count];
+            for (var index = 0; index < _pageViews.Count; index++)
+            {
+                var view = _pageViews[index];
+                if (view.InkLoaded)
+                {
+                    exportPages[index] = view.Page;
+                }
+                else
+                {
+                    exportPages[index] = new NotePage
+                    {
+                        Id = view.Page.Id,
+                        NotebookId = view.Page.NotebookId,
+                        SortOrder = view.Page.SortOrder,
+                        PaperStyle = view.Page.PaperStyle,
+                        ModifiedAt = view.Page.ModifiedAt,
+                        Strokes = await InkFileService.LoadAsync(view.Page.Id),
+                        Photos = await PhotoFileService.LoadAsync(view.Page.Id)
+                    };
+                }
+                TitleContext.Text = $"EXPORTING PDF · {index + 1}/{_pageViews.Count}";
+                await Task.Yield();
+            }
+
+            await PdfExportService.ExportAsync(file.Path, exportPages);
+        }
+        catch (Exception exception)
+        {
+            exportFailure = exception;
+        }
+        finally
+        {
+            MainContent.IsHitTestVisible = true;
+            TitleContext.Text = previousTitle;
+            if (_exportButton is not null)
+            {
+                _exportButton.Content = previousExportContent;
+                _exportButton.IsEnabled = true;
+                ToolTipService.SetToolTip(_exportButton, "Export notebook as PDF");
+            }
+        }
+
+        var resultMessage = new TextBlock
+        {
+            Text = exportFailure is null
+                ? $"Saved as {Path.GetFileName(file.Path)}"
+                : $"The PDF could not be exported. {exportFailure.Message}",
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = Brush(exportFailure is null ? "#C7C7C1" : "#FF8A65")
+        };
+        var resultDialog = Dialog(
+            exportFailure is null ? "PDF exported" : "Export failed",
+            resultMessage,
+            exportFailure is null ? "Open" : "",
+            compact: true);
+        resultDialog.CloseButtonText = "Close";
+        if (exportFailure is null)
+        {
+            var notebookAccentButtonStyle = new Style(typeof(Button))
+            {
+                BasedOn = (Style)Application.Current.Resources["AccentButtonStyle"]
+            };
+            notebookAccentButtonStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brush(_editorAccent)));
+            resultDialog.PrimaryButtonStyle = notebookAccentButtonStyle;
+        }
+        var result = await ShowCenteredDialogAsync(resultDialog);
+        if (exportFailure is null && result == ContentDialogResult.Primary)
+        {
+            var exportedFile = await Windows.Storage.StorageFile.GetFileFromPathAsync(file.Path);
+            await Launcher.LaunchFileAsync(exportedFile);
+        }
+    }
+
+    private static string FormatPdfFileName(string notebookTitle)
+    {
+        var invalid = Path.GetInvalidFileNameChars().ToHashSet();
+        var sanitized = new string(notebookTitle
+            .Normalize()
+            .Select(character => invalid.Contains(character) || char.IsControl(character) ? '-' : character)
+            .ToArray());
+        sanitized = string.Join(' ', sanitized.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            .Trim(' ', '.');
+        if (sanitized.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            sanitized = sanitized[..^4].TrimEnd(' ', '.');
+        if (sanitized.Length > 96) sanitized = sanitized[..96].TrimEnd(' ', '.');
+        if (string.IsNullOrWhiteSpace(sanitized)) sanitized = "A-Note Notebook";
+
+        var reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        };
+        if (reserved.Contains(sanitized)) sanitized = $"A-Note {sanitized}";
+        return $"{sanitized}.pdf";
+    }
+
+    private async Task ShowExportErrorAsync(Exception exception)
+    {
+        var message = new TextBlock
+        {
+            Text = $"The PDF export could not start. {exception.Message}",
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = Brush("#C7C7C1")
+        };
+        var dialog = Dialog("Export failed", message, "", compact: true);
+        dialog.PrimaryButtonText = "";
+        dialog.CloseButtonText = "Close";
+        await ShowCenteredDialogAsync(dialog);
     }
 
     private async Task DuplicatePageAsync(NotePage source)
@@ -2991,7 +3554,7 @@ public sealed partial class MainWindow : Window
         var view = CreatePageView(page, inkLoaded: true);
         // inkLoaded=true means the model already contains the clone; render it immediately
         // instead of waiting for the control to be recreated on the next notebook open.
-        await view.Ink.RefreshInkAsync();
+        await view.EnsureInkLoadedAsync();
         if (view.Root is FrameworkElement element && _pageList is { ActualHeight: > 0 }) element.Height = _pageList.ActualHeight;
         _pageViews.Insert(Math.Min(page.SortOrder, _pageViews.Count), view);
         await NormalizeAndSavePagesAsync();
@@ -3046,7 +3609,7 @@ public sealed partial class MainWindow : Window
         // Lazy pages may not have their ink in memory yet. Load first so clearing cannot be
         // followed by an old on-disk stroke set appearing again later.
         await view.EnsureInkLoadedAsync();
-        view.Ink.ClearAllInk();
+        view.Ink!.ClearAllInk();
 
         // InkChanged marks the view dirty; also persist immediately because this is destructive.
         await _db.SavePageAsync(view.Page, saveInk: true);
@@ -3072,6 +3635,19 @@ public sealed partial class MainWindow : Window
         view.Dispose();
         await _db.DeletePageAsync(page);
         await NormalizeAndSavePagesAsync();
+        if (_pageList is not null)
+        {
+            _pageList.UpdateLayout();
+            var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
+            if (scroll is not null && scroll.VerticalOffset > scroll.ScrollableHeight)
+                scroll.ChangeView(null, scroll.ScrollableHeight, null, true);
+            _syncPageScrollThumb?.Invoke();
+            _pageList.DispatcherQueue.TryEnqueue(() =>
+            {
+                _pageList?.UpdateLayout();
+                _syncPageScrollThumb?.Invoke();
+            });
+        }
         return true;
     }
 
@@ -3171,7 +3747,7 @@ public sealed partial class MainWindow : Window
         for (var i = 0; i < _pageViews.Count; i++)
         {
             _pageViews[i].Page.SortOrder = i;
-            _pageViews[i].PageNumber.Text = $"PAGE {i + 1}";
+            _pageViews[i].UpdateRealizedPageNumber(i + 1);
             _pageViews[i].Page.ModifiedAt = DateTimeOffset.Now;
             await _db.SavePageAsync(_pageViews[i].Page, _pageViews[i].InkLoaded);
         }
@@ -3185,18 +3761,20 @@ public sealed partial class MainWindow : Window
     private void ApplyInputSettings()
     {
         _syncEditorDrawerGestureHitTesting?.Invoke();
+        _syncPageScrollMode?.Invoke();
         foreach (var page in _pageViews)
         {
-            page.Ink.EraserTarget = _eraseTarget;
-            page.Ink.PenInputEnabled = !_penScrollMode;
+            if (page.Ink is not { } ink) continue;
+            ink.EraserTarget = _eraseTarget;
+            ink.PenInputEnabled = !_penScrollMode;
             // In pen-scroll mode the page itself must be completely transparent to hit testing.
             // That lets touch/pen manipulation target the ListView/ScrollViewer directly instead
             // of getting stuck on the full-page ink Canvas. The root-level top-drawer recognizer
             // still sees routed touch first and can take ownership only when the gesture actually
             // qualifies as a drawer open/close gesture.
-            page.Ink.IsHitTestVisible = !_penScrollMode;
-            page.Ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
-            page.Ink.MouseDrawingEnabled = false;
+            ink.IsHitTestVisible = !_penScrollMode;
+            ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
+            ink.MouseDrawingEnabled = false;
         }
     }
 
@@ -3354,6 +3932,26 @@ public sealed partial class MainWindow : Window
         contentHost.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, e) => DismissTextFocus(e)), true);
         dialog.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, e) => DismissTextFocus(e)), true);
 
+        void ApplyEditorDialogAccent()
+        {
+            if (_currentNotebook is null) return;
+            dialog.BorderBrush = Brush(_editorAccent);
+            var primary = Descendants<Button>(dialog).FirstOrDefault(button => button.Name == "PrimaryButton");
+            var close = Descendants<Button>(dialog).FirstOrDefault(button => button.Name == "CloseButton");
+            if (primary is not null)
+            {
+                primary.Background = Brush(_editorAccent);
+                primary.BorderBrush = Brush(_editorAccent);
+                primary.Foreground = Brush("#070706");
+            }
+            if (close is not null)
+            {
+                close.Background = Brush("#00111110");
+                close.BorderBrush = Brush(_editorAccent);
+                close.Foreground = Brush(_editorAccent);
+            }
+        }
+
         dialog.Loaded += (_, _) =>
         {
             var titleHost = Descendants<ContentControl>(dialog).FirstOrDefault(control => control.Name == "Title");
@@ -3385,6 +3983,14 @@ public sealed partial class MainWindow : Window
                     closeButton.Foreground = Brush(_editorAccent);
                 }
             }
+            ApplyEditorDialogAccent();
+        };
+        // ContentDialog creates its popup buttons late. Loaded can run before those template
+        // parts exist, so reapply after Opened and one dispatcher turn later.
+        dialog.Opened += (_, _) =>
+        {
+            ApplyEditorDialogAccent();
+            dialog.DispatcherQueue.TryEnqueue(ApplyEditorDialogAccent);
         };
         return dialog;
     }
@@ -3827,6 +4433,15 @@ public sealed partial class MainWindow : Window
 
     private IntPtr WindowSubclassProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam, UIntPtr subclassId, UIntPtr referenceData)
     {
+        if (_windowInteractionLocked)
+        {
+            if (message == WmClose) return IntPtr.Zero;
+            if (message == WmSysCommand)
+            {
+                var command = wParam.ToInt64() & 0xFFF0;
+                if (command is ScMinimize or ScClose) return IntPtr.Zero;
+            }
+        }
         if (message == WmGetMinMaxInfo)
         {
             var info = Marshal.PtrToStructure<MinMaxInfo>(lParam);
@@ -3884,33 +4499,126 @@ public sealed partial class MainWindow : Window
     {
         private readonly DebouncedAutosave _autosave;
         private readonly DatabaseService _db;
+        private Viewbox? _viewbox;
+        private readonly Func<NotePage, InkPageControl> _inkFactory;
+        private readonly Func<PageView, (Viewbox Viewbox, Border ScaleBorder, UIElement Root, TextBlock PageNumber)> _visualFactory;
+        private readonly bool _modelAlreadyLoaded;
         private int _dirtyRevision;
         private int _savedRevision;
         public NotePage Page { get; }
-        public InkPageControl Ink { get; }
-        public Border ScaleBorder { get; }
-        public UIElement Root { get; }
-        public TextBlock PageNumber { get; }
+        public InkPageControl? Ink { get; private set; }
+        private Border? _scaleBorder;
+        private Grid? _root;
+        private TextBlock? _pageNumber;
+        private bool _visualCreated;
+        public Border ScaleBorder { get { EnsureVisual(); return _scaleBorder!; } }
+        public UIElement Root => _root!;
+        public TextBlock PageNumber { get { EnsureVisual(); return _pageNumber!; } }
         private Task? _inkLoadTask;
         public bool InkLoaded { get; private set; }
-        public PageView(NotePage page, InkPageControl ink, Border scaleBorder, UIElement root, TextBlock pageNumber, bool inkLoaded)
+        public bool LoadAttemptCompleted { get; private set; }
+        public bool IsPresented { get; private set; }
+        public event EventHandler? ContentReady;
+        public event EventHandler? Presented;
+        public PageView(
+            NotePage page,
+            bool modelAlreadyLoaded,
+            Func<NotePage, InkPageControl> inkFactory,
+            Func<PageView, (Viewbox Viewbox, Border ScaleBorder, UIElement Root, TextBlock PageNumber)> visualFactory)
         {
-            Page = page; Ink = ink; ScaleBorder = scaleBorder; Root = root; PageNumber = pageNumber;
-            InkLoaded = inkLoaded;
-            Ink.IsHitTestVisible = inkLoaded;
-            _db = ((MainWindow)App.MainWindowInstance!)._db;
+            Page = page;
+            _modelAlreadyLoaded = modelAlreadyLoaded;
+            _inkFactory = inkFactory;
+            _visualFactory = visualFactory;
+            var window = (MainWindow)App.MainWindowInstance!;
+            _db = window._db;
+
+            // Keep ListView binding side-effect free: the full page visual tree and the
+            // InkPageControl are created before the item is inserted into the collection.
+            _root = new Grid
+            {
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                VerticalAlignment = VerticalAlignment.Stretch,
+                Height = window._pageViewportHeight > 0 ? window._pageViewportHeight : double.NaN
+            };
             _autosave = new DebouncedAutosave(() => SaveAsync());
+
+            EnsureVisual();
+            Ink = _inkFactory(Page);
+            Ink.IsHitTestVisible = false;
+            _viewbox!.Child = Ink;
+            Ink.RegisterDirty(Dirty);
+
+            _root.Loaded += async (_, _) =>
+            {
+                try { await EnsureInkLoadedAsync(); }
+                catch (Exception exception) { TraceNotebookOpen($"page {Page.SortOrder + 1}: load failed: {exception}"); }
+            };
+        }
+        private void EnsureVisual()
+        {
+            if (_visualCreated) return;
+            _visualCreated = true;
+            try
+            {
+                var visual = _visualFactory(this);
+                _viewbox = visual.Viewbox;
+                _scaleBorder = visual.ScaleBorder;
+                _pageNumber = visual.PageNumber;
+            }
+            catch
+            {
+                _visualCreated = false;
+                throw;
+            }
+        }
+        public void SetRealizedHeight(double height)
+        {
+            if (_root is FrameworkElement element) element.Height = height;
+        }
+        public void UpdateRealizedPageNumber(int pageNumber)
+        {
+            if (_pageNumber is not null) _pageNumber.Text = $"PAGE {pageNumber}";
+        }
+        public void NotifyPresented()
+        {
+            if (IsPresented) return;
+            IsPresented = true;
+            Presented?.Invoke(this, EventArgs.Empty);
         }
         public Task EnsureInkLoadedAsync() => InkLoaded ? Task.CompletedTask : _inkLoadTask ??= LoadInkAsync();
         private async Task LoadInkAsync()
         {
-            Page.Strokes = await InkFileService.LoadAsync(Page.Id);
-            Page.Photos = await PhotoFileService.LoadAsync(Page.Id);
-            await Ink.RefreshInkAsync();
-            InkLoaded = true;
-            var window = (MainWindow)App.MainWindowInstance!;
-            Ink.PenInputEnabled = !window._penScrollMode;
-            Ink.IsHitTestVisible = !window._penScrollMode;
+            TraceNotebookOpen($"page {Page.SortOrder + 1}: LoadInkAsync begin");
+            EnsureVisual();
+
+            try
+            {
+                if (!_modelAlreadyLoaded)
+                {
+                    Page.Strokes = await InkFileService.LoadAsync(Page.Id);
+                    Page.Photos = await PhotoFileService.LoadAsync(Page.Id);
+                    TraceNotebookOpen($"page {Page.SortOrder + 1}: files parsed ({Page.Strokes.Count} strokes, {Page.Photos.Count} photos)");
+                }
+
+                var window = (MainWindow)App.MainWindowInstance!;
+                if (_scaleBorder!.ActualWidth > 0 && _scaleBorder.ActualHeight > 0)
+                    window.ApplyPhysicalPaperMetrics(Ink!, _scaleBorder.ActualWidth, _scaleBorder.ActualHeight);
+
+                await Ink!.RefreshInkAsync();
+                TraceNotebookOpen($"page {Page.SortOrder + 1}: ink refresh complete");
+                InkLoaded = true;
+                Ink.PenInputEnabled = !window._penScrollMode;
+                Ink.IsHitTestVisible = !window._penScrollMode;
+            }
+            finally
+            {
+                // ContentReady means the first-page loading attempt is finished. Keeping this in
+                // finally prevents the full-editor loading veil from becoming permanent if a
+                // damaged page asset fails to decode; the existing Loaded handler still traces it.
+                LoadAttemptCompleted = true;
+                ContentReady?.Invoke(this, EventArgs.Empty);
+            }
         }
         public void Dirty() { Page.ModifiedAt = DateTimeOffset.Now; ++_dirtyRevision; _autosave.Request(); }
         private async Task SaveAsync()
@@ -3924,6 +4632,7 @@ public sealed partial class MainWindow : Window
         public Task FlushAsync(DatabaseService db) => SaveAsync();
         public void Dispose() => _autosave.Dispose();
     }
+
 
 }
 

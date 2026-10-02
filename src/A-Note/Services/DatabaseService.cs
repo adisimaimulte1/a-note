@@ -36,6 +36,7 @@ public sealed class DatabaseService
         try
         {
             using var db = Open();
+            await RepairIndexesIfNeededAsync(db);
             using var cmd = db.CreateCommand();
             cmd.CommandText = """
                 CREATE TABLE IF NOT EXISTS notebooks (
@@ -72,6 +73,48 @@ public sealed class DatabaseService
             }
         }
         finally { _gate.Release(); }
+    }
+
+    private static async Task RepairIndexesIfNeededAsync(SqliteConnection db)
+    {
+        if (await IntegrityCheckAsync(db)) return;
+
+        BackupDatabaseSnapshot();
+        using (var repair = db.CreateCommand())
+        {
+            // SQLite can rebuild damaged indexes without rewriting table rows. This recovers
+            // the common interrupted-write case while retaining every notebook and page.
+            repair.CommandText = "REINDEX;";
+            await repair.ExecuteNonQueryAsync();
+        }
+
+        if (!await IntegrityCheckAsync(db))
+            throw new InvalidDataException("A-Note could not safely repair its notebook database. A recovery copy was preserved.");
+    }
+
+    private static async Task<bool> IntegrityCheckAsync(SqliteConnection db)
+    {
+        using var check = db.CreateCommand();
+        // quick_check deliberately skips some index consistency checks. The full check is
+        // required here because a damaged primary-key index otherwise leaves the window blank.
+        check.CommandText = "PRAGMA integrity_check;";
+        var result = (string?)await check.ExecuteScalarAsync();
+        return string.Equals(result, "ok", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void BackupDatabaseSnapshot()
+    {
+        AppPaths.EnsureCreated();
+        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        foreach (var suffix in new[] { "", "-wal", "-shm" })
+        {
+            var source = AppPaths.DatabasePath + suffix;
+            if (!File.Exists(source)) continue;
+            var destination = Path.Combine(AppPaths.DatabaseRecoveryDirectory, $"a-note-{stamp}.db{suffix}");
+            using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            input.CopyTo(output);
+        }
     }
 
     public async Task<List<Notebook>> GetNotebooksAsync(string? search = null)
