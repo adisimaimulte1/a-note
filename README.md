@@ -202,6 +202,12 @@ These features are roadmap items and are not included in the current release.
 
 ---
 
+## License
+
+A-Note is available under the [MIT License](LICENSE).
+
+---
+
 ## Credits
 
 - [Windows App SDK / WinUI 3](https://github.com/microsoft/WindowsAppSDK)
