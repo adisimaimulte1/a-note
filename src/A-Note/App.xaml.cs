@@ -1,4 +1,5 @@
 using Microsoft.UI.Xaml;
+using ANote.Services;
 
 namespace ANote;
 
@@ -8,15 +9,11 @@ public partial class App : Application
 
     public App()
     {
+        CrashLogger.Initialize();
         InitializeComponent();
         UnhandledException += (_, e) =>
         {
-            try
-            {
-                Storage.AppPaths.EnsureCreated();
-                File.WriteAllText(Path.Combine(Storage.AppPaths.Root, "last-crash.txt"), e.Exception.ToString());
-            }
-            catch { }
+            CrashLogger.Write("WinUI.Application.UnhandledException", e.Exception);
         };
     }
 

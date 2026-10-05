@@ -32,6 +32,10 @@ public sealed partial class MainWindow : Window
     private const uint WmSysCommand = 0x0112;
     private const long ScMinimize = 0xF020;
     private const long ScClose = 0xF060;
+    private const uint MfByCommand = 0x00000000;
+    private const uint MfEnabled = 0x00000000;
+    private const uint MfGrayed = 0x00000001;
+    private const uint MfDisabled = 0x00000002;
     private const int MinimumWindowWidth = 1000;
     private const int MinimumWindowHeight = 640;
     private readonly DatabaseService _db = new();
@@ -245,7 +249,12 @@ public sealed partial class MainWindow : Window
 
     private async void OnActivated(object sender, WindowActivatedEventArgs args)
     {
-        if (_appWindow is not null) return;
+        if (_appWindow is not null)
+        {
+            if (_windowInteractionLocked && args.WindowActivationState == WindowActivationState.Deactivated)
+                DispatcherQueue.TryEnqueue(Activate);
+            return;
+        }
         var hwnd = WindowNative.GetWindowHandle(this);
         if (!_windowSubclassInstalled)
             _windowSubclassInstalled = SetWindowSubclass(hwnd, _windowSubclass, new UIntPtr(1), UIntPtr.Zero);
@@ -2977,8 +2986,25 @@ public sealed partial class MainWindow : Window
     {
         _windowInteractionLocked = locked;
         if (_appWindow?.Presenter is OverlappedPresenter presenter)
+        {
             presenter.IsMinimizable = !locked;
+            presenter.IsMaximizable = !locked;
+            presenter.IsResizable = !locked;
+            presenter.IsAlwaysOnTop = locked;
+        }
+        SetCloseCommandEnabled(!locked);
+        if (locked) Activate();
         ApplyWindowLockButtonVisual();
+    }
+
+    private void SetCloseCommandEnabled(bool enabled)
+    {
+        var window = WindowNative.GetWindowHandle(this);
+        var menu = GetSystemMenu(window, false);
+        if (menu == IntPtr.Zero) return;
+        var state = MfByCommand | (enabled ? MfEnabled : MfDisabled | MfGrayed);
+        EnableMenuItem(menu, (uint)ScClose, state);
+        DrawMenuBar(window);
     }
 
     private void ApplyWindowLockButtonVisual()
@@ -2998,7 +3024,7 @@ public sealed partial class MainWindow : Window
             _windowInteractionLocked ? "Locked" : "Unlocked");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetHelpText(
             _windowLockButton,
-            _windowInteractionLocked ? "Close and minimize are blocked." : "Close and minimize are available.");
+            _windowInteractionLocked ? "Window controls are disabled and app-switch gestures return to A-Note." : "Window controls are available.");
     }
 
     private void RefreshToolButtonVisuals()
@@ -3098,9 +3124,11 @@ public sealed partial class MainWindow : Window
             }
             else
                 _eraserEnabled = !_eraserEnabled;
-            ApplyInputSettings();
             RefreshToolButtonVisuals();
             RefreshSelectionAction();
+            // Paint the selected state before propagating the tool across realized pages.
+            // Dense-page selection cleanup can otherwise delay visible button feedback.
+            if (!DispatcherQueue.TryEnqueue(ApplyInputSettings)) ApplyInputSettings();
         });
         button.Tag = "eraser-toggle";
         button.Style = (Style)Application.Current.Resources["OutlineButtonStyle"];
@@ -4485,6 +4513,16 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr window);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetSystemMenu(IntPtr window, bool revert);
+
+    [DllImport("user32.dll")]
+    private static extern uint EnableMenuItem(IntPtr menu, uint item, uint enable);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DrawMenuBar(IntPtr window);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetDC(IntPtr window);

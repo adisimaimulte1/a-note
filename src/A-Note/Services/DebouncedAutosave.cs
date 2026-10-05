@@ -4,6 +4,7 @@ public sealed class DebouncedAutosave : IDisposable
 {
     private readonly Func<Task> _save;
     private readonly TimeSpan _delay;
+    private readonly SemaphoreSlim _saveGate = new(1, 1);
     private CancellationTokenSource? _cts;
 
     public DebouncedAutosave(Func<Task> save, TimeSpan? delay = null)
@@ -25,9 +26,15 @@ public sealed class DebouncedAutosave : IDisposable
         try
         {
             await Task.Delay(_delay, token);
-            await _save();
+            await _saveGate.WaitAsync(token);
+            try { await _save(); }
+            finally { _saveGate.Release(); }
         }
         catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            CrashLogger.Write("DebouncedAutosave", exception);
+        }
     }
 
     public void Dispose()

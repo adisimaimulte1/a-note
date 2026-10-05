@@ -33,13 +33,23 @@ public static class PhotoFileService
 
     public static async Task SaveAtomicAsync(string pageId, IReadOnlyList<PagePhotoData> photos)
     {
+        var snapshot = photos.Select(photo => new PagePhotoData
+        {
+            Id = photo.Id,
+            FileName = photo.FileName,
+            X = photo.X,
+            Y = photo.Y,
+            Width = photo.Width,
+            Height = photo.Height,
+            Rotation = photo.Rotation
+        }).ToList();
         AppPaths.EnsureCreated();
         var target = MetadataPath(pageId);
         var temp = target + ".tmp";
         var backup = target + ".bak";
         await using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 32768, true))
         {
-            await JsonSerializer.SerializeAsync(stream, photos, Options);
+            await JsonSerializer.SerializeAsync(stream, snapshot, Options);
             await stream.FlushAsync();
         }
         if (File.Exists(target)) File.Replace(temp, target, backup, true);
