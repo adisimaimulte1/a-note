@@ -92,6 +92,7 @@ public sealed partial class MainWindow : Window
     private string _editorAccent = "#FF7A18";
     private Action? _syncPageScrollThumb;
     private int _notebookOpenRevision;
+    private bool _notebookOpenInProgress;
     private static readonly object OpenTraceGate = new();
 
     private static void TraceNotebookOpen(string message, bool reset = false)
@@ -998,7 +999,6 @@ public sealed partial class MainWindow : Window
         uint thumbPointerId = 0;
         double thumbDragStartY = 0;
         double thumbDragStartTop = 0;
-
         void SyncNotebookScrollThumb()
         {
             if (libraryScrollViewer is null || scrollTrack.ActualHeight <= 0) return;
@@ -1572,32 +1572,71 @@ public sealed partial class MainWindow : Window
 
         if (action == "open") TraceNotebookOpen("Open button Click: entered", reset: true);
 
+        if (action == "open")
+        {
+            if (_notebookOpenInProgress) return;
+            _notebookOpenInProgress = true;
+            button.IsEnabled = false;
+
+            // Do not enter the notebook transition from inside the Button.Click routed-event
+            // call stack. WinUI can still be completing pointer-state and template callbacks for
+            // the recycled ListViewItem; replacing that tree here intermittently fail-fasts in
+            // Microsoft.UI.Xaml.dll (0xC000027B), which managed exception handlers cannot catch.
+            if (!DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, async () =>
+            {
+                try
+                {
+                    TraceNotebookOpen("deferred open: begin");
+                    await OpenNotebookAsync(notebook);
+                }
+                catch (Exception exception)
+                {
+                    await ShowNotebookOpenFailureAsync(exception);
+                }
+                finally
+                {
+                    _notebookOpenInProgress = false;
+                    if (button.XamlRoot is not null) button.IsEnabled = true;
+                }
+            }))
+            {
+                _notebookOpenInProgress = false;
+                button.IsEnabled = true;
+                await ShowNotebookOpenFailureAsync(new InvalidOperationException("The notebook open command could not be queued."));
+            }
+            return;
+        }
+
         try
         {
             await ExecuteNotebookActionAsync(button, notebook, action);
         }
         catch (Exception exception)
         {
-            // Routed event handlers are async void at the WinUI boundary. Observe every failure
-            // here so malformed page data or an I/O error cannot terminate the whole process.
-            try
-            {
-                AppPaths.EnsureCreated();
-                await File.WriteAllTextAsync(Path.Combine(AppPaths.Root, "last-open-error.txt"), exception.ToString());
-            }
-            catch { }
-
-            var message = new TextBlock
-            {
-                Text = "This notebook could not be opened. Your pages were not changed.",
-                TextWrapping = TextWrapping.Wrap,
-                Foreground = Brush("#C7C7C1")
-            };
-            var dialog = Dialog("Couldn't open notebook", message, "", compact: true);
-            dialog.PrimaryButtonText = "";
-            dialog.CloseButtonText = "Close";
-            await ShowCenteredDialogAsync(dialog);
+            await ShowNotebookOpenFailureAsync(exception);
         }
+    }
+
+    private async Task ShowNotebookOpenFailureAsync(Exception exception)
+    {
+        CrashLogger.Write("Notebook.Open", exception);
+        try
+        {
+            AppPaths.EnsureCreated();
+            await File.WriteAllTextAsync(Path.Combine(AppPaths.Root, "last-open-error.txt"), exception.ToString());
+        }
+        catch { }
+
+        var message = new TextBlock
+        {
+            Text = "This notebook could not be opened. Your pages were not changed.",
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = Brush("#C7C7C1")
+        };
+        var dialog = Dialog("Couldn't open notebook", message, "", compact: true);
+        dialog.PrimaryButtonText = "";
+        dialog.CloseButtonText = "Close";
+        await ShowCenteredDialogAsync(dialog);
     }
 
     private void QueueFavoriteSave(Notebook notebook)
@@ -1819,16 +1858,9 @@ public sealed partial class MainWindow : Window
         _activeInk = null;
         _pageTypeButton = null;
 
-        // Replace the clicked library card on the next dispatcher turn before doing any page
-        // construction. Removing that card synchronously from its own routed Click used to make
-        // WinUI fail-fast inside Microsoft.UI.Xaml.dll. This lightweight surface also gives the
-        // compositor a real ProgressRing to present while the notebook is prepared.
-        await SetMainContentAnimatedAsync(BuildNotebookLoadingView(), forward: true, animateExisting: false);
-        TraceNotebookOpen("loading surface presented");
-        await Task.Yield();
-
-        // Keep the opening path identical to the stable GitHub build: load only page metadata,
-        // build each page's XAML tree before it enters ListView, then present the editor.
+        // Keep the library tree alive while metadata and page models are prepared. The command
+        // itself was deferred until after Button.Click completed, and this avoids introducing a
+        // second short-lived content tree during the sensitive ListView teardown transition.
         TraceNotebookOpen("page metadata query: begin");
         var pages = await _db.GetPagesAsync(notebook.Id, loadInk: false);
         TraceNotebookOpen($"page metadata query: complete ({pages.Count} pages)");
@@ -2025,6 +2057,39 @@ public sealed partial class MainWindow : Window
         uint thumbPointerId = 0;
         double thumbDragStartY = 0;
         double thumbDragStartTop = 0;
+        double? pendingThumbScrollOffset = null;
+        var thumbScrollFrame = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        thumbScrollFrame.Tick += (_, _) =>
+        {
+            if (pageScrollViewer is null || pendingThumbScrollOffset is not double offset) return;
+            pendingThumbScrollOffset = null;
+            pageScrollViewer.ChangeView(null, offset, null, true);
+        };
+        double thumbTargetTop = 0;
+        bool thumbFollowActive = false;
+        void StopThumbFollow()
+        {
+            if (!thumbFollowActive) return;
+            thumbFollowActive = false;
+            CompositionTarget.Rendering -= OnThumbFollowRendering;
+        }
+        void OnThumbFollowRendering(object? sender, object args)
+        {
+            var current = scrollThumb.Translation.Y;
+            var next = current + (thumbTargetTop - current) * .22;
+            if (Math.Abs(thumbTargetTop - next) < .08)
+            {
+                next = thumbTargetTop;
+                StopThumbFollow();
+            }
+            scrollThumb.Translation = new Vector3(0, (float)next, 0);
+        }
+        void StartThumbFollow()
+        {
+            if (thumbFollowActive) return;
+            thumbFollowActive = true;
+            CompositionTarget.Rendering += OnThumbFollowRendering;
+        }
         void SyncPageScrollThumb()
         {
             if (pageScrollViewer is null || scrollTrack.ActualHeight <= 0) return;
@@ -2040,8 +2105,10 @@ public sealed partial class MainWindow : Window
             var travel = Math.Max(0, trackHeight - thumbHeight);
             var top = scrollable <= 0 ? 0 : Math.Clamp(pageScrollViewer.VerticalOffset / scrollable * travel, 0, travel);
             Canvas.SetLeft(scrollThumb, 2);
-            if (double.IsNaN(Canvas.GetTop(scrollThumb)) || Math.Abs(Canvas.GetTop(scrollThumb) - top) > 0.25)
-                Canvas.SetTop(scrollThumb, top);
+            Canvas.SetTop(scrollThumb, 0);
+            thumbTargetTop = top;
+            if (Math.Abs(scrollThumb.Translation.Y - top) > .15)
+                StartThumbFollow();
         }
         _syncPageScrollThumb = SyncPageScrollThumb;
         _syncPageScrollMode = null;
@@ -2049,14 +2116,19 @@ public sealed partial class MainWindow : Window
         {
             pageScrollViewer = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
             if (pageScrollViewer is null) return;
+            var visiblePageIndex = -1;
             pageScrollViewer.ViewChanged += (_, _) =>
             {
                 if (_pageViews.Count == 0) return;
                 var index = Math.Clamp((int)Math.Round(pageScrollViewer.VerticalOffset / Math.Max(1, pageScrollViewer.ViewportHeight)), 0, _pageViews.Count - 1);
-                var activeView = _pageViews[index];
-                _activeInk = activeView.Ink;
-                if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
-                RefreshHistoryActions();
+                if (index != visiblePageIndex)
+                {
+                    visiblePageIndex = index;
+                    var activeView = _pageViews[index];
+                    _activeInk = activeView.Ink;
+                    if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
+                    RefreshHistoryActions();
+                }
                 SyncPageScrollThumb();
             };
             SyncPageScrollThumb();
@@ -2148,15 +2220,16 @@ public sealed partial class MainWindow : Window
             pendingPenScrollDelta = 0;
             if (Math.Abs(penScrollVelocity) >= 0.02) penScrollInertia.Start();
         }), true);
-        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); };
+        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); thumbScrollFrame.Stop(); StopThumbFollow(); };
         scrollThumb.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || !scrollThumb.CapturePointer(e.Pointer)) return;
             thumbDragging = true;
             thumbPointerId = e.Pointer.PointerId;
             thumbDragStartY = e.GetCurrentPoint(scrollTrack).Position.Y;
-            thumbDragStartTop = Canvas.GetTop(scrollThumb);
-            if (double.IsNaN(thumbDragStartTop)) thumbDragStartTop = 0;
+            thumbDragStartTop = thumbTargetTop;
+            pendingThumbScrollOffset = null;
+            thumbScrollFrame.Start();
             e.Handled = true;
         };
         scrollThumb.PointerMoved += (_, e) =>
@@ -2166,19 +2239,31 @@ public sealed partial class MainWindow : Window
             if (travel <= 0) return;
             var top = Math.Clamp(thumbDragStartTop + e.GetCurrentPoint(scrollTrack).Position.Y - thumbDragStartY, 0, travel);
             var scrollable = Math.Max(0, pageScrollViewer.ExtentHeight - pageScrollViewer.ViewportHeight);
-            pageScrollViewer.ChangeView(null, scrollable * top / travel, null, true);
+            thumbTargetTop = top;
+            StartThumbFollow();
+            pendingThumbScrollOffset = scrollable * top / travel;
             e.Handled = true;
         };
         void EndThumbDrag(PointerRoutedEventArgs e)
         {
             if (!thumbDragging || e.Pointer.PointerId != thumbPointerId) return;
             thumbDragging = false;
+            thumbScrollFrame.Stop();
+            if (pageScrollViewer is not null && pendingThumbScrollOffset is double offset)
+                pageScrollViewer.ChangeView(null, offset, null, true);
+            pendingThumbScrollOffset = null;
             scrollThumb.ReleasePointerCapture(e.Pointer);
+            SyncPageScrollThumb();
             e.Handled = true;
         }
         scrollThumb.PointerReleased += (_, e) => EndThumbDrag(e);
         scrollThumb.PointerCanceled += (_, e) => EndThumbDrag(e);
-        scrollThumb.PointerCaptureLost += (_, _) => thumbDragging = false;
+        scrollThumb.PointerCaptureLost += (_, _) =>
+        {
+            thumbDragging = false;
+            thumbScrollFrame.Stop();
+            pendingThumbScrollOffset = null;
+        };
         scrollTrack.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || FindAncestor<Border>(e.OriginalSource as DependencyObject) == scrollThumb) return;
@@ -3203,6 +3288,7 @@ public sealed partial class MainWindow : Window
         };
         ink.SetAccentColor(_editorAccent);
         ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
+        ink.PageAtPoint = FindInkPageAtPoint;
         ink.InkChanged += (_, _) => { ink.TagAsDirty(); _activeInk = ink; };
         ink.PenActivity += (_, _) => _lastPenActivity = DateTimeOffset.UtcNow;
         ink.SelectionChanged += (_, _) =>
@@ -3213,11 +3299,23 @@ public sealed partial class MainWindow : Window
         {
             if (_activeInk == ink) RefreshHistoryActions();
         };
+        ink.LinkedHistoryRequested += (transactionId, undo) =>
+        {
+            foreach (var page in _pageViews)
+                page.Ink?.ApplyLinkedHistory(transactionId, undo);
+            RefreshHistoryActions();
+        };
+        ink.InteractionActivated += (_, _) =>
+        {
+            _activeInk = ink;
+            RefreshSelectionAction();
+            RefreshHistoryActions();
+        };
         ink.WritingStateChanged += (_, writing) =>
         {
             if (writing) _lastPenActivity = DateTimeOffset.UtcNow;
             _activeInk = ink;
-            if (_floatingToolbar is not null) _floatingToolbar.Visibility = writing ? Visibility.Collapsed : Visibility.Visible;
+            if (_floatingToolbar is not null) _floatingToolbar.Visibility = Visibility.Visible;
         };
         ink.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, _) =>
         {
@@ -3227,6 +3325,40 @@ public sealed partial class MainWindow : Window
             if (_pageTypeButton is not null) _pageTypeButton.Content = ink.Page.PaperStyle.ToString();
         }), true);
         return ink;
+    }
+
+    private InkPageHit FindInkPageAtPoint(InkPageControl source, Windows.Foundation.Point sourcePoint)
+    {
+        // Pointer capture keeps delivering samples to the page where the pen went down.
+        // Only the source and its immediate neighbors can contain the sample. Avoid scanning
+        // and transforming every notebook page for every coalesced pen point.
+        var sourceIndex = -1;
+        for (var index = 0; index < _pageViews.Count; index++)
+            if (ReferenceEquals(_pageViews[index].Ink, source)) { sourceIndex = index; break; }
+        if (sourceIndex < 0) return default;
+
+        Span<int> candidates = stackalloc int[3];
+        candidates[0] = sourceIndex;
+        candidates[1] = sourcePoint.Y < 0 ? sourceIndex - 1 : sourceIndex + 1;
+        candidates[2] = sourcePoint.Y < 0 ? sourceIndex + 1 : sourceIndex - 1;
+        foreach (var index in candidates)
+        {
+            if (index < 0 || index >= _pageViews.Count) continue;
+            var candidate = _pageViews[index].Ink;
+            if (candidate is null || !candidate.IsLoaded || !candidate.IsHitTestVisible) continue;
+            try
+            {
+                var local = source.TransformToVisual(candidate).TransformPoint(sourcePoint);
+                if (local.X >= 0 && local.X <= InkPageControl.PaperWidth &&
+                    local.Y >= 0 && local.Y <= InkPageControl.PaperHeight)
+                    return new InkPageHit(candidate, local);
+            }
+            catch (InvalidOperationException)
+            {
+                // A recycled ListView container can leave the visual tree between samples.
+            }
+        }
+        return default;
     }
 
     private PageView CreatePageView(NotePage page, bool inkLoaded = true)
@@ -3621,10 +3753,10 @@ public sealed partial class MainWindow : Window
     private async Task<bool> ClearOnlyPageAsync(PageView view)
     {
         var confirmation = Dialog(
-            "Clear page?",
+            $"Clear page {view.Page.SortOrder + 1}?",
             new TextBlock
             {
-                Text = "This is the only page. Its handwriting will be permanently cleared.",
+                Text = $"Page {view.Page.SortOrder + 1} is the only page. All of its handwriting will be permanently cleared.",
                 TextWrapping = TextWrapping.Wrap
             },
             "Clear",
@@ -3648,8 +3780,8 @@ public sealed partial class MainWindow : Window
     {
         if (_pageViews.Count == 1) return false;
         var confirmation = Dialog(
-            "Delete page?",
-            new TextBlock { Text = "This page and its handwriting will be permanently deleted.", TextWrapping = TextWrapping.Wrap },
+            $"Delete page {page.SortOrder + 1}?",
+            new TextBlock { Text = $"Page {page.SortOrder + 1} and all of its handwriting will be permanently deleted.", TextWrapping = TextWrapping.Wrap },
             "Delete",
             destructive: true,
             compact: true);

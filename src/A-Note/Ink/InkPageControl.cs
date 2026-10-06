@@ -15,6 +15,8 @@ using Windows.UI;
 
 namespace ANote.Ink;
 
+public readonly record struct InkPageHit(InkPageControl? Page, Point Point);
+
 public sealed class InkPageControl : UserControl
 {
     public const double PaperWidth = 1280;
@@ -23,18 +25,22 @@ public sealed class InkPageControl : UserControl
     private readonly Canvas _photoCanvas = new() { IsHitTestVisible = false };
     private readonly Canvas _highlightCanvas = new() { IsHitTestVisible = false };
     private readonly Canvas _inkCanvas = new() { Background = new SolidColorBrush(Colors.Transparent) };
+    private readonly Canvas _liveHighlightCanvas = new() { IsHitTestVisible = false };
+    private readonly Canvas _livePenCanvas = new() { IsHitTestVisible = false };
     private readonly Canvas _photoUiCanvas = new() { IsHitTestVisible = true };
     private readonly PathGeometry _highlightGeometry = new();
     private readonly Microsoft.UI.Xaml.Shapes.Path _highlightPath;
     private PolyLineSegment? _activeHighlightSegment;
-    private PathFigure? _activeHighlightFigure;
+    private readonly PathGeometry _liveHighlightGeometry = new();
+    private readonly Microsoft.UI.Xaml.Shapes.Path _liveHighlightPath;
     private readonly PathGeometry[] _penGeometries = [new(), new(), new(), new()];
     private readonly Microsoft.UI.Xaml.Shapes.Path[] _penPaths = new Microsoft.UI.Xaml.Shapes.Path[4];
+    private readonly PathGeometry[] _livePenGeometries = [new(), new(), new(), new()];
+    private readonly Microsoft.UI.Xaml.Shapes.Path[] _livePenPaths = new Microsoft.UI.Xaml.Shapes.Path[4];
     private readonly Dictionary<string, List<(int Bucket, PathFigure Figure)>> _penStrokeFigures = [];
     private readonly Dictionary<string, PathFigure> _highlightStrokeFigures = [];
     private PolyLineSegment? _activePenSegment;
     private int _activePenBucket = -1;
-    private readonly List<(int Bucket, PathFigure Figure)> _activePenFigures = [];
     private readonly Canvas _selectionInkCanvas = new() { IsHitTestVisible = false };
     private readonly Canvas _eraserCursorCanvas = new() { IsHitTestVisible = false };
     private readonly Ellipse _eraserCursor = new()
@@ -115,11 +121,19 @@ public sealed class InkPageControl : UserControl
     private readonly Dictionary<string, List<(int X, int Y)>> _strokeSpatialCells = [];
     private readonly Dictionary<string, InkStrokeData> _eraseOriginals = [];
     private readonly HashSet<string> _eraseGeneratedIds = [];
+    private readonly List<(Point Position, float Pressure)> _pendingEraserSamples = [];
     private readonly HashSet<string> _selectedIds = [];
     private InkStrokeData? _activeStroke;
     private Point _lastPoint;
     private Point _lassoOrigin;
     private bool _isPointerDown;
+    private InkPageControl? _routedGesturePage;
+    private InkPageControl? _selectionPreviewPage;
+    private InkPageControl? _externalSelectionOwner;
+    private double _selectionPreviewStartDragX;
+    private double _selectionPreviewStartDragY;
+    private Rect _selectionPreviewBounds;
+    private Guid _routedTransactionId;
     private bool _movingSelection;
     private double _selectionDragX;
     private double _selectionDragY;
@@ -142,11 +156,14 @@ public sealed class InkPageControl : UserControl
     public string HighlighterColor { get; set; } = "#FF7A18";
     public bool MouseDrawingEnabled { get; set; }
     public bool PenInputEnabled { get; set; } = true;
+    public Func<InkPageControl, Point, InkPageHit>? PageAtPoint { get; set; }
     public event EventHandler? InkChanged;
     public event EventHandler<bool>? WritingStateChanged;
     public event EventHandler? PenActivity;
     public event EventHandler? SelectionChanged;
     public event EventHandler? HistoryChanged;
+    public event Action<Guid, bool>? LinkedHistoryRequested;
+    public event EventHandler? InteractionActivated;
 
     public bool HasSelection => _selectedIds.Count > 0;
     public bool IsPhotoInteractionActive => _photoManipulationActive || _photoDragElement is not null || _photoTouches.Count > 0 || _photoRotating || _photoScaling;
@@ -182,6 +199,17 @@ public sealed class InkPageControl : UserControl
         };
         _highlightCanvas.Children.Add(_highlightPath);
         root.Children.Add(_highlightCanvas);
+        _liveHighlightPath = new Microsoft.UI.Xaml.Shapes.Path
+        {
+            Data = _liveHighlightGeometry,
+            StrokeThickness = 15,
+            StrokeStartLineCap = PenLineCap.Round,
+            StrokeEndLineCap = PenLineCap.Round,
+            StrokeLineJoin = PenLineJoin.Round,
+            IsHitTestVisible = false
+        };
+        _liveHighlightCanvas.Children.Add(_liveHighlightPath);
+        root.Children.Add(_liveHighlightCanvas);
         for (var bucket = 0; bucket < 4; bucket++)
         {
             _penPaths[bucket] = new Microsoft.UI.Xaml.Shapes.Path
@@ -195,8 +223,20 @@ public sealed class InkPageControl : UserControl
                 IsHitTestVisible = false
             };
             _inkCanvas.Children.Add(_penPaths[bucket]);
+            _livePenPaths[bucket] = new Microsoft.UI.Xaml.Shapes.Path
+            {
+                Data = _livePenGeometries[bucket],
+                Stroke = new SolidColorBrush(Color.FromArgb(255, 239, 239, 234)),
+                StrokeThickness = 2.3 * (0.55 + (bucket + .5) / 4d * .8),
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                IsHitTestVisible = false
+            };
+            _livePenCanvas.Children.Add(_livePenPaths[bucket]);
         }
         root.Children.Add(_inkCanvas);
+        root.Children.Add(_livePenCanvas);
         _eraserCursorCanvas.Children.Add(_eraserCursor);
         root.Children.Add(_eraserCursorCanvas);
         _selectionInkCanvas.RenderTransform = _selectionInkTransform;
@@ -221,7 +261,7 @@ public sealed class InkPageControl : UserControl
             ApplySelectionDeleteAccent();
             ApplyPhotoAccent();
         };
-        _selectionDeleteButton.Click += (_, _) => DeleteSelection();
+        _selectionDeleteButton.Click += (_, _) => (_externalSelectionOwner ?? this).DeleteSelection();
         _photoDeleteButton.Click += async (_, _) => await DeleteSelectedPhotoAsync();
         ConfigureFloatingButtonInput(_selectionDeleteButton);
         ConfigureFloatingButtonInput(_photoDeleteButton);
@@ -1095,7 +1135,7 @@ public sealed class InkPageControl : UserControl
         await RefreshPhotosAsync();
         _undo.Clear();
         _redo.Clear();
-        RebuildStrokeBounds();
+        RebuildStrokeSpatialIndex();
         HistoryChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -1191,6 +1231,9 @@ public sealed class InkPageControl : UserControl
                 return;
         }
         _isPointerDown = true;
+        _pendingEraserSamples.Clear();
+        _routedGesturePage = this;
+        _routedTransactionId = Guid.NewGuid();
         _lastPoint = point.Position;
         UpdateEraserCursor(_lastPoint, true);
         _inkCanvas.CapturePointer(e.Pointer);
@@ -1199,7 +1242,6 @@ public sealed class InkPageControl : UserControl
         {
             _eraseOriginals.Clear();
             _eraseGeneratedIds.Clear();
-            RebuildStrokeSpatialIndex();
             EraseSweep([_lastPoint]);
         }
         else if (Tool == InkTool.Lasso)
@@ -1240,17 +1282,15 @@ public sealed class InkPageControl : UserControl
             if (_activeStroke.Tool == "highlighter")
             {
                 var figure = new PathFigure { StartPoint = point.Position };
-                _activeHighlightFigure = figure;
                 _activeHighlightSegment = new PolyLineSegment();
                 figure.Segments.Add(_activeHighlightSegment);
-                _highlightGeometry.Figures.Add(figure);
-                _highlightPath.Stroke = new SolidColorBrush(ParseColor(HighlighterColor, 220));
+                _liveHighlightGeometry.Figures.Add(figure);
+                _liveHighlightPath.Stroke = new SolidColorBrush(ParseColor(HighlighterColor, 220));
             }
             else
             {
                 _activePenSegment = null;
                 _activePenBucket = -1;
-                _activePenFigures.Clear();
             }
             Page.Strokes.Add(_activeStroke);
         }
@@ -1264,6 +1304,26 @@ public sealed class InkPageControl : UserControl
         PenActivity?.Invoke(this, EventArgs.Empty);
         HidePointerCursor();
         var points = e.GetIntermediatePoints(_inkCanvas).Reverse().ToList();
+        if (Tool == InkTool.Lasso && !_movingSelection && PageAtPoint is not null)
+        {
+            foreach (var point in points) RouteLassoSample(point.Position);
+            e.Handled = true;
+            return;
+        }
+        if (Tool != InkTool.Lasso && PageAtPoint is not null)
+        {
+            if (Tool == InkTool.Eraser)
+            {
+                foreach (var point in points)
+                    _pendingEraserSamples.Add((point.Position, Math.Clamp(point.Properties.Pressure, .15f, 1f)));
+                e.Handled = true;
+                return;
+            }
+            foreach (var point in points)
+                RoutePointerSample(point.Position, Math.Clamp(point.Properties.Pressure, .15f, 1f));
+            e.Handled = true;
+            return;
+        }
         if (Tool == InkTool.Eraser)
         {
             var sweep = new List<Point>(points.Count + 1) { _lastPoint };
@@ -1299,14 +1359,13 @@ public sealed class InkPageControl : UserControl
                     _activeHighlightSegment?.Points.Add(smoothed);
                 else
                 {
-                    var bucket = Math.Clamp((int)Math.Round(pressure * 3), 0, 3);
+                    var bucket = PressureBucket(pressure, _activePenBucket);
                     if (_activePenSegment is null || bucket != _activePenBucket)
                     {
                         var figure = new PathFigure { StartPoint = _lastPoint };
                         _activePenSegment = new PolyLineSegment();
                         figure.Segments.Add(_activePenSegment);
-                        _penGeometries[bucket].Figures.Add(figure);
-                        _activePenFigures.Add((bucket, figure));
+                        _livePenGeometries[bucket].Figures.Add(figure);
                         _activePenBucket = bucket;
                     }
                     _activePenSegment.Points.Add(smoothed);
@@ -1324,15 +1383,22 @@ public sealed class InkPageControl : UserControl
         _isPointerDown = false;
         // Do not restore the cursor on pen-up; the pen is usually still hovering and Windows
         // would flash its cursor between strokes. PointerExited or mouse activity restores it.
+        if (Tool != InkTool.Lasso && PageAtPoint is not null)
+        {
+            FlushPendingEraserSamples();
+            _routedGesturePage?.FinishRoutedSegment(_routedTransactionId);
+            _routedGesturePage = null;
+            _inkCanvas.ReleasePointerCapture(e.Pointer);
+            WritingStateChanged?.Invoke(this, false);
+            e.Handled = true;
+            return;
+        }
         var completedStroke = _activeStroke;
         _activeStroke = null;
-        var completedHighlightFigure = _activeHighlightFigure;
-        var completedPenFigures = _activePenFigures.ToList();
-        _activeHighlightFigure = null;
         _activeHighlightSegment = null;
         _activePenSegment = null;
         _activePenBucket = -1;
-        _activePenFigures.Clear();
+        ClearLiveInkPreview();
         _inkCanvas.ReleasePointerCapture(e.Pointer);
         if (Tool == InkTool.Eraser)
         {
@@ -1347,25 +1413,240 @@ public sealed class InkPageControl : UserControl
                 InkChanged?.Invoke(this, EventArgs.Empty);
                 HistoryChanged?.Invoke(this, EventArgs.Empty);
             }
-            else SelectInLasso();
+            else
+            {
+                var selectionPage = _routedGesturePage ?? this;
+                selectionPage.SelectInLasso();
+                selectionPage.InteractionActivated?.Invoke(selectionPage, EventArgs.Empty);
+                _routedGesturePage = null;
+            }
         }
         else
         {
             if (completedStroke is not null)
             {
                 _strokeBounds[completedStroke.Id] = BoundsOf(completedStroke);
-                if (completedStroke.Tool == "highlighter" && completedHighlightFigure is not null)
-                    _highlightStrokeFigures[completedStroke.Id] = completedHighlightFigure;
-                else if (completedStroke.Tool != "highlighter")
-                    _penStrokeFigures[completedStroke.Id] = completedPenFigures;
+                AddStrokeToSpatialIndex(completedStroke);
+                AddStrokeVisual(completedStroke);
                 PushEdit(new InkEdit([], [completedStroke]));
             }
-            // Pen and highlighter both append directly into retained geometries while drawing,
-            // so pen-up performs no full-page rebuild even on extremely dense pages.
+            // The small live preview is merged into retained page geometry only on pen-up.
+            // This keeps pointer feedback independent from all previously completed ink.
             InkChanged?.Invoke(this, EventArgs.Empty);
         }
         WritingStateChanged?.Invoke(this, false);
         e.Handled = true;
+    }
+
+    private void RoutePointerSample(Point sourcePoint, float pressure)
+    {
+        var hit = PageAtPoint?.Invoke(this, sourcePoint) ?? new InkPageHit(null, default);
+        var target = hit.Page;
+        if (!ReferenceEquals(target, _routedGesturePage))
+        {
+            _routedGesturePage?.FinishRoutedSegment(_routedTransactionId);
+            _routedGesturePage = target;
+            if (target is not null)
+            {
+                target.StartRoutedSegment(hit.Point, pressure, this);
+            }
+            return;
+        }
+
+        if (target is null) return;
+        target.AppendRoutedSample(hit.Point, pressure);
+    }
+
+    private void FlushPendingEraserSamples()
+    {
+        if (_pendingEraserSamples.Count == 0) return;
+        var samples = _pendingEraserSamples.ToArray();
+        _pendingEraserSamples.Clear();
+        RouteEraserSamples(samples);
+    }
+
+    private void RouteEraserSamples(IReadOnlyList<(Point Position, float Pressure)> points)
+    {
+        List<Point>? sweep = null;
+        InkPageControl? sweepPage = null;
+        void Flush()
+        {
+            if (sweepPage is null || sweep is null || sweep.Count < 2) return;
+            sweepPage.EraseSweep(sweep);
+            sweepPage._lastPoint = sweep[^1];
+            sweepPage.UpdateEraserCursor(sweep[^1], true);
+        }
+
+        foreach (var sample in points)
+        {
+            var hit = PageAtPoint?.Invoke(this, sample.Position) ?? new InkPageHit(null, default);
+            if (!ReferenceEquals(hit.Page, _routedGesturePage))
+            {
+                Flush();
+                sweep = null;
+                sweepPage = null;
+                _routedGesturePage?.FinishRoutedSegment(_routedTransactionId);
+                _routedGesturePage = hit.Page;
+                if (hit.Page is not null) hit.Page.StartRoutedSegment(hit.Point, sample.Pressure, this);
+                continue;
+            }
+            if (hit.Page is null || Distance(hit.Page._lastPoint, hit.Point) < .9) continue;
+            if (!ReferenceEquals(sweepPage, hit.Page))
+            {
+                Flush();
+                sweepPage = hit.Page;
+                sweep = [hit.Page._lastPoint];
+            }
+            sweep!.Add(hit.Point);
+        }
+        Flush();
+    }
+
+    private void RouteLassoSample(Point sourcePoint)
+    {
+        var hit = PageAtPoint?.Invoke(this, sourcePoint) ?? new InkPageHit(null, default);
+        var target = hit.Page;
+        if (!ReferenceEquals(target, _routedGesturePage))
+        {
+            if (_routedGesturePage is not null)
+            {
+                _routedGesturePage.ClearSelectionState();
+                _routedGesturePage.RenderAll();
+            }
+            _routedGesturePage = target;
+            if (target is null) return;
+            target.StartRoutedLasso(hit.Point);
+            return;
+        }
+        if (target is null) return;
+        target.UpdateLasso(hit.Point);
+    }
+
+    private void StartRoutedLasso(Point point)
+    {
+        ClearSelectionState();
+        _lassoOrigin = point;
+        _lastPoint = point;
+        _selection.Visibility = Visibility.Visible;
+        Canvas.SetLeft(_selection, point.X);
+        Canvas.SetTop(_selection, point.Y);
+        _selection.Width = 0;
+        _selection.Height = 0;
+    }
+
+    private void StartRoutedSegment(Point point, float pressure, InkPageControl owner)
+    {
+        Tool = owner.Tool;
+        EraserTarget = owner.EraserTarget;
+        HighlighterColor = owner.HighlighterColor;
+        _lastPoint = point;
+        if (Tool == InkTool.Eraser)
+        {
+            _eraseOriginals.Clear();
+            _eraseGeneratedIds.Clear();
+            EraseSweep([point]);
+            return;
+        }
+
+        _activeStroke = new InkStrokeData
+        {
+            Tool = Tool == InkTool.Highlighter ? "highlighter" : "pen",
+            Color = Tool == InkTool.Highlighter ? HighlighterColor : "#EFEFEA",
+            Width = Tool == InkTool.Highlighter ? 15 : 2.3
+        };
+        _activeStroke.Points.Add(new InkPointData { X = (float)point.X, Y = (float)point.Y, Pressure = pressure });
+        Page.Strokes.Add(_activeStroke);
+        if (_activeStroke.Tool == "highlighter")
+        {
+            var figure = new PathFigure { StartPoint = point };
+            _activeHighlightSegment = new PolyLineSegment();
+            figure.Segments.Add(_activeHighlightSegment);
+            _liveHighlightGeometry.Figures.Add(figure);
+            _liveHighlightPath.Stroke = new SolidColorBrush(ParseColor(HighlighterColor, 220));
+        }
+        else
+        {
+            _activePenSegment = null;
+            _activePenBucket = -1;
+        }
+    }
+
+    private void AppendRoutedSample(Point point, float pressure)
+    {
+        if (Distance(_lastPoint, point) < .9) return;
+        if (Tool == InkTool.Eraser)
+        {
+            EraseSweep([_lastPoint, point]);
+            _lastPoint = point;
+            UpdateEraserCursor(point, true);
+            return;
+        }
+        if (_activeStroke is null) return;
+        var smoothed = new Point(_lastPoint.X * .28 + point.X * .72, _lastPoint.Y * .28 + point.Y * .72);
+        _activeStroke.Points.Add(new InkPointData { X = (float)smoothed.X, Y = (float)smoothed.Y, Pressure = pressure });
+        if (_activeStroke.Tool == "highlighter")
+            _activeHighlightSegment?.Points.Add(smoothed);
+        else
+        {
+            var bucket = PressureBucket(pressure, _activePenBucket);
+            if (_activePenSegment is null || bucket != _activePenBucket)
+            {
+                var figure = new PathFigure { StartPoint = _lastPoint };
+                _activePenSegment = new PolyLineSegment();
+                figure.Segments.Add(_activePenSegment);
+                _livePenGeometries[bucket].Figures.Add(figure);
+                _activePenBucket = bucket;
+            }
+            _activePenSegment.Points.Add(smoothed);
+        }
+        _lastPoint = smoothed;
+    }
+
+    private void FinishRoutedSegment(Guid transactionId)
+    {
+        if (Tool == InkTool.Eraser)
+        {
+            FinishEraseGesture(transactionId);
+            _eraserCursor.Visibility = Visibility.Collapsed;
+            return;
+        }
+        var completed = _activeStroke;
+        _activeStroke = null;
+        _activeHighlightSegment = null;
+        _activePenSegment = null;
+        _activePenBucket = -1;
+        ClearLiveInkPreview();
+        if (completed is null) return;
+        _strokeBounds[completed.Id] = BoundsOf(completed);
+        AddStrokeToSpatialIndex(completed);
+        AddStrokeVisual(completed);
+        PushEdit(new InkEdit([], [completed], transactionId));
+        InkChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void ClearLiveInkPreview()
+    {
+        _liveHighlightGeometry.Figures.Clear();
+        for (var bucket = 0; bucket < _livePenGeometries.Length; bucket++)
+            _livePenGeometries[bucket].Figures.Clear();
+    }
+
+    private static int PressureBucket(float pressure, int currentBucket)
+    {
+        var requested = Math.Clamp((int)Math.Round(pressure * 3), 0, 3);
+        if (currentBucket < 0 || requested == currentBucket) return requested;
+
+        // A small hysteresis band prevents normal stylus pressure noise from alternating
+        // buckets and producing dozens of tiny PathFigures during a single long stroke.
+        const double margin = .055;
+        if (requested > currentBucket)
+        {
+            var upwardBoundary = (currentBucket + .5) / 3d + margin;
+            return pressure >= upwardBoundary ? requested : currentBucket;
+        }
+
+        var downwardBoundary = (currentBucket - .5) / 3d - margin;
+        return pressure <= downwardBoundary ? requested : currentBucket;
     }
 
     private void MoveSelectionTo(Point current)
@@ -1382,23 +1663,259 @@ public sealed class InkPageControl : UserControl
         Canvas.SetTop(_selection, Canvas.GetTop(_selection) + dy);
         _lastPoint = current;
         PositionSelectionDeleteButton();
+        UpdateSelectionTransferPreview();
     }
 
     private void CommitSelectionMove()
     {
         if (Math.Abs(_selectionDragX) < .01 && Math.Abs(_selectionDragY) < .01) return;
-        foreach (var stroke in Page.Strokes.Where(s => _selectedIds.Contains(s.Id)))
+        var moved = Page.Strokes.Where(s => _selectedIds.Contains(s.Id)).ToList();
+        // Keep immutable snapshots on both sides of the move. Storing the same mutable
+        // stroke objects here made a selection move invisible to Undo/Redo.
+        var before = moved.Select(CloneStroke).ToList();
+        var destination = _selectionPreviewPage ?? (PageAtPoint?.Invoke(this, _lastPoint) ?? default).Page;
+        Rect destinationSelectionBounds = Rect.Empty;
+        if (destination is not null && !ReferenceEquals(destination, this))
+            destinationSelectionBounds = TransformSelectionRect(destination);
+        ClearSelectionTransferPreview();
+        if (destination is not null && !ReferenceEquals(destination, this))
+        {
+            var transform = TransformToVisual(destination);
+            var transferred = moved.Select(stroke =>
+            {
+                var copy = CloneStroke(stroke);
+                foreach (var point in copy.Points)
+                {
+                    var mapped = transform.TransformPoint(new Point(
+                        point.X + _selectionDragX,
+                        point.Y + _selectionDragY));
+                    point.X = (float)mapped.X;
+                    point.Y = (float)mapped.Y;
+                }
+                return copy;
+            }).ToList();
+            var transactionId = Guid.NewGuid();
+            foreach (var stroke in moved)
+            {
+                RemoveStrokeVisual(stroke);
+                RemoveStrokeFromSpatialIndex(stroke.Id);
+                _strokeBounds.Remove(stroke.Id);
+            }
+            Page.Strokes.RemoveAll(stroke => _selectedIds.Contains(stroke.Id));
+            PushEdit(new InkEdit(before, [], transactionId));
+            ClearSelectionState();
+            RenderAll();
+            destination.AcceptTransferredSelection(transferred, transactionId, destinationSelectionBounds);
+            InkChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        foreach (var stroke in moved)
             foreach (var point in stroke.Points)
             {
                 point.X += (float)_selectionDragX;
                 point.Y += (float)_selectionDragY;
             }
+        var after = moved.Select(CloneStroke).ToList();
         _selectionDragX = 0;
         _selectionDragY = 0;
         _selectionInkTransform.X = 0;
         _selectionInkTransform.Y = 0;
+        foreach (var stroke in moved)
+        {
+            RemoveStrokeFromSpatialIndex(stroke.Id);
+            _strokeBounds[stroke.Id] = BoundsOf(stroke);
+            AddStrokeToSpatialIndex(stroke);
+        }
         RenderAll();
         PositionSelectionDeleteButton();
+        PushEdit(new InkEdit(before, after));
+    }
+
+    private void UpdateSelectionTransferPreview()
+    {
+        if (_selectedIds.Count == 0 || PageAtPoint is null) return;
+        var center = new Point(
+            Canvas.GetLeft(_selection) + _selection.Width / 2d,
+            Canvas.GetTop(_selection) + _selection.Height / 2d);
+        var hit = PageAtPoint(this, center);
+        var destination = hit.Page;
+        if (ReferenceEquals(destination, this) || destination is null)
+        {
+            ClearSelectionTransferPreview();
+            _selectionInkCanvas.Visibility = Visibility.Visible;
+            _selection.Visibility = Visibility.Visible;
+            PositionSelectionDeleteButton();
+            return;
+        }
+
+        if (_selectionPreviewPage is not null && !ReferenceEquals(_selectionPreviewPage, destination))
+            _selectionPreviewPage.ClearExternalSelectionPreview();
+        _selectionInkCanvas.Visibility = Visibility.Collapsed;
+        _selection.Visibility = Visibility.Collapsed;
+        _selectionDeleteButton.Visibility = Visibility.Collapsed;
+
+        if (ReferenceEquals(_selectionPreviewPage, destination))
+        {
+            destination.UpdateExternalSelectionPreview(
+                _selectionDragX - _selectionPreviewStartDragX,
+                _selectionDragY - _selectionPreviewStartDragY,
+                _selectionPreviewBounds);
+            return;
+        }
+
+        _selectionPreviewPage = destination;
+        _selectionPreviewStartDragX = _selectionDragX;
+        _selectionPreviewStartDragY = _selectionDragY;
+
+        var transform = TransformToVisual(destination);
+        var previewBounds = TransformSelectionRect(destination);
+        var preview = Page.Strokes.Where(stroke => _selectedIds.Contains(stroke.Id)).Select(stroke =>
+        {
+            var copy = CloneStroke(stroke);
+            foreach (var point in copy.Points)
+            {
+                var mapped = transform.TransformPoint(new Point(point.X + _selectionDragX, point.Y + _selectionDragY));
+                point.X = (float)mapped.X;
+                point.Y = (float)mapped.Y;
+            }
+            return copy;
+        }).ToList();
+        _selectionPreviewBounds = destination.ShowExternalSelectionPreview(preview, previewBounds, this);
+    }
+
+    private Rect TransformSelectionRect(InkPageControl destination)
+    {
+        var transform = TransformToVisual(destination);
+        var topLeft = transform.TransformPoint(new Point(Canvas.GetLeft(_selection), Canvas.GetTop(_selection)));
+        var bottomRight = transform.TransformPoint(new Point(
+            Canvas.GetLeft(_selection) + _selection.Width,
+            Canvas.GetTop(_selection) + _selection.Height));
+        return new Rect(
+            Math.Min(topLeft.X, bottomRight.X),
+            Math.Min(topLeft.Y, bottomRight.Y),
+            Math.Abs(bottomRight.X - topLeft.X),
+            Math.Abs(bottomRight.Y - topLeft.Y));
+    }
+
+    private Rect ShowExternalSelectionPreview(IReadOnlyList<InkStrokeData> strokes, Rect bounds, InkPageControl owner)
+    {
+        _externalSelectionOwner = owner;
+        _selectionInkCanvas.Children.Clear();
+        _selectionInkCanvas.Visibility = Visibility.Visible;
+        _selectionInkTransform.X = 0;
+        _selectionInkTransform.Y = 0;
+        RenderHighlights(strokes.Where(stroke => stroke.Tool == "highlighter"), _selectionInkCanvas, selected: true);
+        RenderPenStrokes(strokes.Where(stroke => stroke.Tool != "highlighter"), _selectionInkCanvas, selected: true);
+        if (strokes.Count == 0) return Rect.Empty;
+        Canvas.SetLeft(_selection, bounds.X);
+        Canvas.SetTop(_selection, bounds.Y);
+        _selection.Width = bounds.Width;
+        _selection.Height = bounds.Height;
+        _selection.Visibility = Visibility.Visible;
+        _deleteButtonHasPosition = false;
+        PositionSelectionDeleteButton(force: true);
+        SnapSelectionDeleteButtonToTarget();
+        return bounds;
+    }
+
+    private void UpdateExternalSelectionPreview(double dx, double dy, Rect originalBounds)
+    {
+        // The selected geometry is built once when its center crosses the page boundary.
+        // Every subsequent pointer sample is a compositor transform, not a geometry rebuild.
+        _selectionInkTransform.X = dx;
+        _selectionInkTransform.Y = dy;
+        Canvas.SetLeft(_selection, originalBounds.X + dx);
+        Canvas.SetTop(_selection, originalBounds.Y + dy);
+        PositionSelectionDeleteButton(force: true);
+        SnapSelectionDeleteButtonToTarget();
+    }
+
+    private void ClearSelectionTransferPreview()
+    {
+        if (_selectionPreviewPage is null) return;
+        _selectionPreviewPage.ClearExternalSelectionPreview();
+        _selectionPreviewPage = null;
+        _selectionInkCanvas.Visibility = Visibility.Visible;
+    }
+
+    private void ClearExternalSelectionPreview()
+    {
+        _selectionInkCanvas.Children.Clear();
+        _selectionInkTransform.X = 0;
+        _selectionInkTransform.Y = 0;
+        _selection.Visibility = Visibility.Collapsed;
+        _selectionDeleteButton.Visibility = Visibility.Collapsed;
+        _deleteButtonHasPosition = false;
+        _externalSelectionOwner = null;
+    }
+
+    private void SnapSelectionDeleteButtonToTarget()
+    {
+        Canvas.SetLeft(_selectionDeleteButton, _deleteButtonTarget.X);
+        Canvas.SetTop(_selectionDeleteButton, _deleteButtonTarget.Y);
+        _selectionDeleteButton.Visibility = Visibility.Visible;
+    }
+
+    private static Rect Union(Rect left, Rect right) => new(
+        Math.Min(left.Left, right.Left),
+        Math.Min(left.Top, right.Top),
+        Math.Max(left.Right, right.Right) - Math.Min(left.Left, right.Left),
+        Math.Max(left.Bottom, right.Bottom) - Math.Min(left.Top, right.Top));
+
+    private void AcceptTransferredSelection(IReadOnlyList<InkStrokeData> strokes, Guid transactionId, Rect selectionBounds)
+    {
+        ClearSelectionState();
+        foreach (var stroke in strokes)
+        {
+            Page.Strokes.Add(stroke);
+            _selectedIds.Add(stroke.Id);
+            _strokeBounds[stroke.Id] = BoundsOf(stroke);
+            AddStrokeToSpatialIndex(stroke);
+        }
+        PushEdit(new InkEdit([], strokes, transactionId));
+        Canvas.SetLeft(_selection, selectionBounds.X);
+        Canvas.SetTop(_selection, selectionBounds.Y);
+        _selection.Width = selectionBounds.Width;
+        _selection.Height = selectionBounds.Height;
+        _selection.Visibility = Visibility.Visible;
+        _selectionInkCanvas.Visibility = Visibility.Visible;
+        _deleteButtonHasPosition = false;
+        PositionSelectionDeleteButton();
+        RenderAll();
+        InkChanged?.Invoke(this, EventArgs.Empty);
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        InteractionActivated?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void SetSelectionBoundsFromSelectedStrokes()
+    {
+        var selected = Page.Strokes.Where(stroke => _selectedIds.Contains(stroke.Id)).ToList();
+        if (selected.Count == 0) return;
+        var bounds = selected.Select(BoundsOf).Aggregate((left, right) => new Rect(
+            Math.Min(left.Left, right.Left),
+            Math.Min(left.Top, right.Top),
+            Math.Max(left.Right, right.Right) - Math.Min(left.Left, right.Left),
+            Math.Max(left.Bottom, right.Bottom) - Math.Min(left.Top, right.Top)));
+        Canvas.SetLeft(_selection, bounds.X);
+        Canvas.SetTop(_selection, bounds.Y);
+        _selection.Width = bounds.Width;
+        _selection.Height = bounds.Height;
+        _selection.Visibility = Visibility.Visible;
+        _deleteButtonHasPosition = false;
+        PositionSelectionDeleteButton();
+    }
+
+    private void ClearSelectionState()
+    {
+        _selectedIds.Clear();
+        _selection.Visibility = Visibility.Collapsed;
+        _selectionDeleteButton.Visibility = Visibility.Collapsed;
+        _deleteButtonHasPosition = false;
+        _selectionDragX = 0;
+        _selectionDragY = 0;
+        _selectionInkTransform.X = 0;
+        _selectionInkTransform.Y = 0;
+        _selectionInkCanvas.Visibility = Visibility.Visible;
     }
 
     private void UpdateLasso(Point current)
@@ -1430,9 +1947,9 @@ public sealed class InkPageControl : UserControl
         SelectionChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void PositionSelectionDeleteButton()
+    private void PositionSelectionDeleteButton(bool force = false)
     {
-        if (_selectedIds.Count == 0 || _selection.Visibility != Visibility.Visible)
+        if ((!force && _selectedIds.Count == 0) || _selection.Visibility != Visibility.Visible)
         {
             _selectionDeleteButton.Visibility = Visibility.Collapsed;
             return;
@@ -1463,6 +1980,7 @@ public sealed class InkPageControl : UserControl
 
     private void OnSelectionUiRendering(object? sender, object e)
     {
+        FlushPendingEraserSamples();
         if (_selectionDeleteButton.Visibility == Visibility.Visible && _deleteButtonHasPosition)
         {
             var left = Canvas.GetLeft(_selectionDeleteButton);
@@ -1509,7 +2027,11 @@ public sealed class InkPageControl : UserControl
         if (_selectedIds.Count == 0) return;
         var removed = Page.Strokes.Where(s => _selectedIds.Contains(s.Id)).ToList();
         Page.Strokes.RemoveAll(s => _selectedIds.Contains(s.Id));
-        foreach (var stroke in removed) _strokeBounds.Remove(stroke.Id);
+        foreach (var stroke in removed)
+        {
+            RemoveStrokeFromSpatialIndex(stroke.Id);
+            _strokeBounds.Remove(stroke.Id);
+        }
         PushEdit(new InkEdit(removed, []));
         _selectedIds.Clear(); _selection.Visibility = Visibility.Collapsed;
         _selectionDeleteButton.Visibility = Visibility.Collapsed;
@@ -1525,6 +2047,8 @@ public sealed class InkPageControl : UserControl
         _redo.Clear();
         _undo.Clear();
         _strokeBounds.Clear();
+        _strokeSpatialIndex.Clear();
+        _strokeSpatialCells.Clear();
         _selectedIds.Clear();
         _selection.Visibility = Visibility.Collapsed;
         _selectionDeleteButton.Visibility = Visibility.Collapsed;
@@ -1552,11 +2076,20 @@ public sealed class InkPageControl : UserControl
                 _strokeBounds[stroke.Id] = bounds = BoundsOf(stroke);
             if (!RectsIntersect(Expanded(bounds, EraserRadius + stroke.Width / 2d), sweepBounds)) continue;
 
-            var sampledPoints = DensifyStroke(stroke.Points);
+            // Fresh handwriting is already sampled at sub-pixel spacing. Reallocating and
+            // densifying the entire stroke on every eraser frame was the dominant deletion
+            // cost. Only legacy/sparse strokes need interpolation before splitting.
+            IReadOnlyList<InkPointData> sampledPoints = HasSparseSegments(stroke.Points)
+                ? DensifyStroke(stroke.Points)
+                : stroke.Points;
             var keep = new bool[sampledPoints.Count];
             Array.Fill(keep, true);
             var hit = false;
-            var visualRadius = EraserRadius + stroke.Width / 2d;
+            // The cursor describes the area removed from the rendered stroke. Expanding the
+            // center-line hit radius by half the stroke width made a 15 px highlight lose a
+            // much wider section than the circle showed. Subtracting half-width keeps the
+            // visible cut close to the cursor for both highlights and normal pen strokes.
+            var visualRadius = Math.Max(2, EraserRadius - stroke.Width / 2d);
             for (var pointIndex = 0; pointIndex < sampledPoints.Count; pointIndex++)
             {
                 var point = sampledPoints[pointIndex];
@@ -1610,10 +2143,25 @@ public sealed class InkPageControl : UserControl
         return result;
     }
 
+    private static bool HasSparseSegments(IReadOnlyList<InkPointData> points)
+    {
+        for (var index = 1; index < points.Count; index++)
+        {
+            var dx = points[index].X - points[index - 1].X;
+            var dy = points[index].Y - points[index - 1].Y;
+            if (dx * dx + dy * dy > 16) return true;
+        }
+        return false;
+    }
+
     private void RebuildStrokeSpatialIndex()
     {
         _strokeSpatialIndex.Clear();
         _strokeSpatialCells.Clear();
+        // Bounds are coordinates, not permanent stroke metadata. Moves and undo/redo can
+        // replace a stroke under the same id, so retaining the old rectangle makes the
+        // eraser query the location where the stroke used to be.
+        _strokeBounds.Clear();
         foreach (var stroke in Page.Strokes) AddStrokeToSpatialIndex(stroke);
     }
 
@@ -1717,28 +2265,44 @@ public sealed class InkPageControl : UserControl
     public void Undo()
     {
         if (_undo.Count == 0) return;
+        if (_undo.Peek().TransactionId != Guid.Empty)
+        {
+            LinkedHistoryRequested?.Invoke(_undo.Peek().TransactionId, true);
+            return;
+        }
         var edit = _undo.Pop();
+        ClearSelectionState();
         ApplyEdit(edit, undo: true);
+        RenderAll();
         _redo.Push(edit);
         InkChanged?.Invoke(this, EventArgs.Empty);
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
         HistoryChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public void Redo()
     {
         if (_redo.Count == 0) return;
+        if (_redo.Peek().TransactionId != Guid.Empty)
+        {
+            LinkedHistoryRequested?.Invoke(_redo.Peek().TransactionId, false);
+            return;
+        }
         var edit = _redo.Pop();
+        ClearSelectionState();
         ApplyEdit(edit, undo: false);
+        RenderAll();
         _undo.Push(edit);
         InkChanged?.Invoke(this, EventArgs.Empty);
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
         HistoryChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void FinishEraseGesture()
+    private void FinishEraseGesture(Guid transactionId = default)
     {
         if (_eraseOriginals.Count == 0) return;
         var added = Page.Strokes.Where(stroke => _eraseGeneratedIds.Contains(stroke.Id)).ToList();
-        PushEdit(new InkEdit(_eraseOriginals.Values.ToList(), added));
+        PushEdit(new InkEdit(_eraseOriginals.Values.ToList(), added, transactionId));
         _eraseOriginals.Clear();
         _eraseGeneratedIds.Clear();
         InkChanged?.Invoke(this, EventArgs.Empty);
@@ -1772,6 +2336,21 @@ public sealed class InkPageControl : UserControl
         }
     }
 
+    public void ApplyLinkedHistory(Guid transactionId, bool undo)
+    {
+        var source = undo ? _undo : _redo;
+        var destination = undo ? _redo : _undo;
+        if (source.Count == 0 || source.Peek().TransactionId != transactionId) return;
+        var edit = source.Pop();
+        ClearSelectionState();
+        ApplyEdit(edit, undo);
+        RenderAll();
+        destination.Push(edit);
+        InkChanged?.Invoke(this, EventArgs.Empty);
+        SelectionChanged?.Invoke(this, EventArgs.Empty);
+        HistoryChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     private static IEnumerable<InkStrokeData> SplitStroke(InkStrokeData source, IReadOnlyList<InkPointData> sampledPoints, bool[] keep)
     {
         List<InkPointData>? points = null;
@@ -1797,6 +2376,20 @@ public sealed class InkPageControl : UserControl
         Color = source.Color,
         Width = source.Width,
         Points = points
+    };
+
+    private static InkStrokeData CloneStroke(InkStrokeData source) => new()
+    {
+        Id = source.Id,
+        Tool = source.Tool,
+        Color = source.Color,
+        Width = source.Width,
+        Points = source.Points.Select(point => new InkPointData
+        {
+            X = point.X,
+            Y = point.Y,
+            Pressure = point.Pressure
+        }).ToList()
     };
 
     private void RebuildStrokeBounds()
@@ -1831,7 +2424,7 @@ public sealed class InkPageControl : UserControl
         return Distance(point, new Point(start.X + dx * amount, start.Y + dy * amount));
     }
 
-    private sealed record InkEdit(IReadOnlyList<InkStrokeData> Removed, IReadOnlyList<InkStrokeData> Added);
+    private sealed record InkEdit(IReadOnlyList<InkStrokeData> Removed, IReadOnlyList<InkStrokeData> Added, Guid TransactionId = default);
 
     private void RenderAll()
     {
