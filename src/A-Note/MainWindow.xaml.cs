@@ -2057,39 +2057,6 @@ public sealed partial class MainWindow : Window
         uint thumbPointerId = 0;
         double thumbDragStartY = 0;
         double thumbDragStartTop = 0;
-        double? pendingThumbScrollOffset = null;
-        var thumbScrollFrame = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-        thumbScrollFrame.Tick += (_, _) =>
-        {
-            if (pageScrollViewer is null || pendingThumbScrollOffset is not double offset) return;
-            pendingThumbScrollOffset = null;
-            pageScrollViewer.ChangeView(null, offset, null, true);
-        };
-        double thumbTargetTop = 0;
-        bool thumbFollowActive = false;
-        void StopThumbFollow()
-        {
-            if (!thumbFollowActive) return;
-            thumbFollowActive = false;
-            CompositionTarget.Rendering -= OnThumbFollowRendering;
-        }
-        void OnThumbFollowRendering(object? sender, object args)
-        {
-            var current = scrollThumb.Translation.Y;
-            var next = current + (thumbTargetTop - current) * .22;
-            if (Math.Abs(thumbTargetTop - next) < .08)
-            {
-                next = thumbTargetTop;
-                StopThumbFollow();
-            }
-            scrollThumb.Translation = new Vector3(0, (float)next, 0);
-        }
-        void StartThumbFollow()
-        {
-            if (thumbFollowActive) return;
-            thumbFollowActive = true;
-            CompositionTarget.Rendering += OnThumbFollowRendering;
-        }
         void SyncPageScrollThumb()
         {
             if (pageScrollViewer is null || scrollTrack.ActualHeight <= 0) return;
@@ -2105,10 +2072,8 @@ public sealed partial class MainWindow : Window
             var travel = Math.Max(0, trackHeight - thumbHeight);
             var top = scrollable <= 0 ? 0 : Math.Clamp(pageScrollViewer.VerticalOffset / scrollable * travel, 0, travel);
             Canvas.SetLeft(scrollThumb, 2);
-            Canvas.SetTop(scrollThumb, 0);
-            thumbTargetTop = top;
-            if (Math.Abs(scrollThumb.Translation.Y - top) > .15)
-                StartThumbFollow();
+            if (double.IsNaN(Canvas.GetTop(scrollThumb)) || Math.Abs(Canvas.GetTop(scrollThumb) - top) > 0.25)
+                Canvas.SetTop(scrollThumb, top);
         }
         _syncPageScrollThumb = SyncPageScrollThumb;
         _syncPageScrollMode = null;
@@ -2116,20 +2081,26 @@ public sealed partial class MainWindow : Window
         {
             pageScrollViewer = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
             if (pageScrollViewer is null) return;
-            var visiblePageIndex = -1;
-            pageScrollViewer.ViewChanged += (_, _) =>
+            pageScrollViewer.ViewChanged += async (_, _) =>
             {
                 if (_pageViews.Count == 0) return;
                 var index = Math.Clamp((int)Math.Round(pageScrollViewer.VerticalOffset / Math.Max(1, pageScrollViewer.ViewportHeight)), 0, _pageViews.Count - 1);
-                if (index != visiblePageIndex)
-                {
-                    visiblePageIndex = index;
-                    var activeView = _pageViews[index];
-                    _activeInk = activeView.Ink;
-                    if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
-                    RefreshHistoryActions();
-                }
+                var activeView = _pageViews[index];
+                _activeInk = activeView.Ink;
+                if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
+                RefreshHistoryActions();
                 SyncPageScrollThumb();
+                try
+                {
+                    // A direct thumb drag can reach a virtualized page before its Loaded event is
+                    // dispatched. Start its lazy load from the scroll event as well so the target
+                    // page is never left as an empty viewport.
+                    await activeView.EnsureInkLoadedAsync();
+                }
+                catch (Exception exception)
+                {
+                    TraceNotebookOpen($"page {activeView.Page.SortOrder + 1}: visible-page load failed: {exception}");
+                }
             };
             SyncPageScrollThumb();
         };
@@ -2220,16 +2191,15 @@ public sealed partial class MainWindow : Window
             pendingPenScrollDelta = 0;
             if (Math.Abs(penScrollVelocity) >= 0.02) penScrollInertia.Start();
         }), true);
-        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); thumbScrollFrame.Stop(); StopThumbFollow(); };
+        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); };
         scrollThumb.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || !scrollThumb.CapturePointer(e.Pointer)) return;
             thumbDragging = true;
             thumbPointerId = e.Pointer.PointerId;
             thumbDragStartY = e.GetCurrentPoint(scrollTrack).Position.Y;
-            thumbDragStartTop = thumbTargetTop;
-            pendingThumbScrollOffset = null;
-            thumbScrollFrame.Start();
+            thumbDragStartTop = Canvas.GetTop(scrollThumb);
+            if (double.IsNaN(thumbDragStartTop)) thumbDragStartTop = 0;
             e.Handled = true;
         };
         scrollThumb.PointerMoved += (_, e) =>
@@ -2239,31 +2209,19 @@ public sealed partial class MainWindow : Window
             if (travel <= 0) return;
             var top = Math.Clamp(thumbDragStartTop + e.GetCurrentPoint(scrollTrack).Position.Y - thumbDragStartY, 0, travel);
             var scrollable = Math.Max(0, pageScrollViewer.ExtentHeight - pageScrollViewer.ViewportHeight);
-            thumbTargetTop = top;
-            StartThumbFollow();
-            pendingThumbScrollOffset = scrollable * top / travel;
+            pageScrollViewer.ChangeView(null, scrollable * top / travel, null, true);
             e.Handled = true;
         };
         void EndThumbDrag(PointerRoutedEventArgs e)
         {
             if (!thumbDragging || e.Pointer.PointerId != thumbPointerId) return;
             thumbDragging = false;
-            thumbScrollFrame.Stop();
-            if (pageScrollViewer is not null && pendingThumbScrollOffset is double offset)
-                pageScrollViewer.ChangeView(null, offset, null, true);
-            pendingThumbScrollOffset = null;
             scrollThumb.ReleasePointerCapture(e.Pointer);
-            SyncPageScrollThumb();
             e.Handled = true;
         }
         scrollThumb.PointerReleased += (_, e) => EndThumbDrag(e);
         scrollThumb.PointerCanceled += (_, e) => EndThumbDrag(e);
-        scrollThumb.PointerCaptureLost += (_, _) =>
-        {
-            thumbDragging = false;
-            thumbScrollFrame.Stop();
-            pendingThumbScrollOffset = null;
-        };
+        scrollThumb.PointerCaptureLost += (_, _) => thumbDragging = false;
         scrollTrack.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || FindAncestor<Border>(e.OriginalSource as DependencyObject) == scrollThumb) return;
@@ -2664,7 +2622,10 @@ public sealed partial class MainWindow : Window
                 await nextView.EnsureInkLoadedAsync();
                 _activeInk = nextView.Ink;
                 if (_pageTypeButton is not null) _pageTypeButton.Content = nextView.Page.PaperStyle.ToString();
-                await AnimatePageDeleteReplacementAsync(nextView);
+                // Removing an item makes ItemsStackPanel preserve and clamp its own viewport.
+                // Do not issue another ChangeView here: that delayed second navigation was able
+                // to pull the scrollbar back to the bottom after the page had already reflowed.
+                _syncPageScrollThumb?.Invoke();
             }
             // Keep the page controls visible after a delete so several pages can be removed
             // without repeatedly pulling the drawer down.
@@ -3369,7 +3330,7 @@ public sealed partial class MainWindow : Window
         var page = view.Page;
         TraceNotebookOpen($"page {page.SortOrder + 1}: visual realization begin");
         var viewbox = new Viewbox { Stretch = Stretch.Fill, HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
-        var scaled = new Border { Child = viewbox, Background = Brush("#0A0A09"), BorderBrush = Brush("#282825"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(2), Opacity = 0 };
+        var scaled = new Border { Child = viewbox, Background = Brush("#0A0A09"), BorderBrush = Brush("#282825"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(2), Opacity = 1 };
         // Cache the composed page as a texture. Filled pages otherwise force WinUI to re-rasterize
         // hundreds/thousands of vector stroke segments every frame while the notebook scrolls.
         // The cache is invalidated automatically when ink changes, but scrolling becomes a cheap
@@ -3403,7 +3364,7 @@ public sealed partial class MainWindow : Window
         {
             if (!hasFinalMetrics || !view.LoadAttemptCompleted || revealStarted) return;
             revealStarted = true;
-            await AnimateElementAsync(scaled, 0, 1, 0, 0, 0, 0, 120);
+            await Task.CompletedTask;
             view.NotifyPresented();
         }
         scaled.SizeChanged += (_, e) =>
@@ -3795,19 +3756,7 @@ public sealed partial class MainWindow : Window
         view.Dispose();
         await _db.DeletePageAsync(page);
         await NormalizeAndSavePagesAsync();
-        if (_pageList is not null)
-        {
-            _pageList.UpdateLayout();
-            var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
-            if (scroll is not null && scroll.VerticalOffset > scroll.ScrollableHeight)
-                scroll.ChangeView(null, scroll.ScrollableHeight, null, true);
-            _syncPageScrollThumb?.Invoke();
-            _pageList.DispatcherQueue.TryEnqueue(() =>
-            {
-                _pageList?.UpdateLayout();
-                _syncPageScrollThumb?.Invoke();
-            });
-        }
+        _syncPageScrollThumb?.Invoke();
         return true;
     }
 
