@@ -1883,9 +1883,6 @@ public sealed partial class MainWindow : Window
             }
 
             _pageViews.Add(CreatePageView(page, inkLoaded: false));
-            // Page controls are intentionally created on the UI apartment. Yield between them so
-            // the loading ring continues animating for notebooks with many pages.
-            await Task.Yield();
         }
 
         TraceNotebookOpen("BuildEditor: begin");
@@ -1902,26 +1899,23 @@ public sealed partial class MainWindow : Window
         TitleBarGestureTarget.Visibility = Visibility.Visible;
         TraceNotebookOpen("title-bar gesture target visible");
 
-        if (_pageViews.Count > 0)
-        {
-            _activeInk = _pageViews[0].Ink;
-            if (_pageTypeButton is not null) _pageTypeButton.Content = _pageViews[0].Page.PaperStyle.ToString();
-            RefreshHistoryActions();
-        }
-
-        // Do not force unrealized pages to render just to dismiss the loading overlay.
-        // PageView already loads the first visible page from its normal Loaded callback;
-        // ContentReady fires after that page has finished loading ink/photos and refreshing.
-        // This keeps ListView virtualization intact and avoids touching XAML controls before
-        // WinUI has attached them to the visual tree.
         if (_pageViews.Count == 0)
         {
             HideEditorLoadingOverlay();
         }
         else
         {
-            var firstPage = _pageViews[0];
-            if (firstPage.IsPresented)
+            // Notebooks are append-oriented, so open directly at the newest page. ScrollIntoView
+            // asks the virtualizing panel to realize only that container instead of walking every
+            // preceding page. Its ink is then the sole page payload loaded during initial open.
+            var lastPage = _pageViews[^1];
+            _pageList?.ScrollIntoView(lastPage, ScrollIntoViewAlignment.Leading);
+            await lastPage.EnsureInkLoadedAsync();
+            _activeInk = lastPage.Ink;
+            if (_pageTypeButton is not null) _pageTypeButton.Content = lastPage.Page.PaperStyle.ToString();
+            RefreshHistoryActions();
+
+            if (lastPage.IsPresented)
             {
                 HideEditorLoadingOverlay();
             }
@@ -1930,11 +1924,11 @@ public sealed partial class MainWindow : Window
                 EventHandler? readyHandler = null;
                 readyHandler = (_, _) =>
                 {
-                    firstPage.Presented -= readyHandler;
+                    lastPage.Presented -= readyHandler;
                     if (openRevision == _notebookOpenRevision && _currentNotebook?.Id == notebook.Id)
                         HideEditorLoadingOverlay();
                 };
-                firstPage.Presented += readyHandler;
+                lastPage.Presented += readyHandler;
             }
         }
 
@@ -2027,7 +2021,7 @@ public sealed partial class MainWindow : Window
           </Style>
         """);
         _pageList.ItemsPanel = (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load("""
-          <ItemsPanelTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"><ItemsStackPanel Orientation="Vertical" AreStickyGroupHeadersEnabled="False"/></ItemsPanelTemplate>
+          <ItemsPanelTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"><ItemsStackPanel Orientation="Vertical" AreStickyGroupHeadersEnabled="False" CacheLength="2"/></ItemsPanelTemplate>
         """);
         var pageHost = new Grid { ColumnSpacing = 14 };
         pageHost.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -2057,6 +2051,25 @@ public sealed partial class MainWindow : Window
         uint thumbPointerId = 0;
         double thumbDragStartY = 0;
         double thumbDragStartTop = 0;
+        PageView? pageAwaitingLoad = null;
+        var settledPageLoadTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(90) };
+        settledPageLoadTimer.Tick += async (_, _) =>
+        {
+            settledPageLoadTimer.Stop();
+            var page = pageAwaitingLoad;
+            if (page is null || !_pageViews.Contains(page)) return;
+            try
+            {
+                await page.EnsureInkLoadedAsync();
+                if (!ReferenceEquals(pageAwaitingLoad, page)) return;
+                _activeInk = page.Ink;
+                RefreshHistoryActions();
+            }
+            catch (Exception exception)
+            {
+                TraceNotebookOpen($"page {page.Page.SortOrder + 1}: settled-page load failed: {exception}");
+            }
+        };
         void SyncPageScrollThumb()
         {
             if (pageScrollViewer is null || scrollTrack.ActualHeight <= 0) return;
@@ -2081,26 +2094,18 @@ public sealed partial class MainWindow : Window
         {
             pageScrollViewer = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
             if (pageScrollViewer is null) return;
-            pageScrollViewer.ViewChanged += async (_, _) =>
+            pageScrollViewer.ViewChanged += (_, _) =>
             {
                 if (_pageViews.Count == 0) return;
                 var index = Math.Clamp((int)Math.Round(pageScrollViewer.VerticalOffset / Math.Max(1, pageScrollViewer.ViewportHeight)), 0, _pageViews.Count - 1);
                 var activeView = _pageViews[index];
-                _activeInk = activeView.Ink;
                 if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
-                RefreshHistoryActions();
                 SyncPageScrollThumb();
-                try
-                {
-                    // A direct thumb drag can reach a virtualized page before its Loaded event is
-                    // dispatched. Start its lazy load from the scroll event as well so the target
-                    // page is never left as an empty viewport.
-                    await activeView.EnsureInkLoadedAsync();
-                }
-                catch (Exception exception)
-                {
-                    TraceNotebookOpen($"page {activeView.Page.SortOrder + 1}: visible-page load failed: {exception}");
-                }
+                // During a fling, update only the cheap page chrome. Restarting this timer skips
+                // the expensive ink/photo realization for pages that merely pass through view.
+                pageAwaitingLoad = activeView;
+                settledPageLoadTimer.Stop();
+                settledPageLoadTimer.Start();
             };
             SyncPageScrollThumb();
         };
@@ -2191,7 +2196,7 @@ public sealed partial class MainWindow : Window
             pendingPenScrollDelta = 0;
             if (Math.Abs(penScrollVelocity) >= 0.02) penScrollInertia.Start();
         }), true);
-        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); };
+        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); settledPageLoadTimer.Stop(); };
         scrollThumb.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || !scrollThumb.CapturePointer(e.Pointer)) return;
@@ -4652,27 +4657,17 @@ public sealed partial class MainWindow : Window
             var window = (MainWindow)App.MainWindowInstance!;
             _db = window._db;
 
-            // Keep ListView binding side-effect free: the full page visual tree and the
-            // InkPageControl are created before the item is inserted into the collection.
+            // Phase zero is intentionally just a viewport-sized placeholder. The ListView can
+            // create and recycle these cheaply while flinging; the full ink tree is deferred
+            // until the settled-page loader explicitly requests it.
             _root = new Grid
             {
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 VerticalAlignment = VerticalAlignment.Stretch,
-                Height = window._pageViewportHeight > 0 ? window._pageViewportHeight : double.NaN
+                Height = window._pageViewportHeight > 0 ? window._pageViewportHeight : double.NaN,
+                Background = Brush("#0A0A09")
             };
             _autosave = new DebouncedAutosave(() => SaveAsync());
-
-            EnsureVisual();
-            Ink = _inkFactory(Page);
-            Ink.IsHitTestVisible = false;
-            _viewbox!.Child = Ink;
-            Ink.RegisterDirty(Dirty);
-
-            _root.Loaded += async (_, _) =>
-            {
-                try { await EnsureInkLoadedAsync(); }
-                catch (Exception exception) { TraceNotebookOpen($"page {Page.SortOrder + 1}: load failed: {exception}"); }
-            };
         }
         private void EnsureVisual()
         {
@@ -4684,9 +4679,14 @@ public sealed partial class MainWindow : Window
                 _viewbox = visual.Viewbox;
                 _scaleBorder = visual.ScaleBorder;
                 _pageNumber = visual.PageNumber;
+                Ink = _inkFactory(Page);
+                Ink.IsHitTestVisible = false;
+                _viewbox.Child = Ink;
+                Ink.RegisterDirty(Dirty);
             }
             catch
             {
+                Ink = null;
                 _visualCreated = false;
                 throw;
             }
