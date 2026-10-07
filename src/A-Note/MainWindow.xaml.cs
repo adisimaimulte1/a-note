@@ -1905,30 +1905,92 @@ public sealed partial class MainWindow : Window
         }
         else
         {
-            // Notebooks are append-oriented, so open directly at the newest page. ScrollIntoView
-            // asks the virtualizing panel to realize only that container instead of walking every
-            // preceding page. Its ink is then the sole page payload loaded during initial open.
+            // Notebooks are append-oriented, so open directly at the newest page. Positioning the
+            // ScrollViewer at its absolute extent is deterministic for the final item; asking the
+            // virtualizing panel for leading alignment can leave its previous container anchored.
             var lastPage = _pageViews[^1];
-            _pageList?.ScrollIntoView(lastPage, ScrollIntoViewAlignment.Leading);
-            await lastPage.EnsureInkLoadedAsync();
-            _activeInk = lastPage.Ink;
+            _pageList?.UpdateLayout();
             if (_pageTypeButton is not null) _pageTypeButton.Content = lastPage.Page.PaperStyle.ToString();
-            RefreshHistoryActions();
 
-            if (lastPage.IsPresented)
+            void PositionAtNotebookEnd()
             {
+                if (_pageList is null || !_pageViews.Contains(lastPage)) return;
+                _pageList.UpdateLayout();
+                var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
+                if (scroll is not null)
+                    scroll.ChangeView(null, scroll.ScrollableHeight, null, true);
+            }
+
+            Task<bool> PositionAtNotebookEndAndWaitAsync()
+            {
+                if (_pageList is null) return Task.FromResult(false);
+                _pageList.UpdateLayout();
+                var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
+                if (scroll is null) return Task.FromResult(false);
+
+                var completion = new TaskCompletionSource<bool>();
+                var stableFrames = 0;
+                var previousScrollableHeight = double.NaN;
+                void OnOpeningFrame(object? sender, object args)
+                {
+                    if (_pageList is null || openRevision != _notebookOpenRevision ||
+                        _currentNotebook?.Id != notebook.Id || !_pageViews.Contains(lastPage))
+                    {
+                        CompositionTarget.Rendering -= OnOpeningFrame;
+                        completion.TrySetResult(false);
+                        return;
+                    }
+
+                    _pageList.UpdateLayout();
+                    var bottom = scroll.ScrollableHeight;
+                    var atBottom = Math.Abs(scroll.VerticalOffset - bottom) < .5;
+                    var extentStable = !double.IsNaN(previousScrollableHeight) &&
+                        Math.Abs(previousScrollableHeight - bottom) < .25;
+                    var finalContainerLoaded = lastPage.Root is FrameworkElement element && element.IsLoaded;
+
+                    if (!atBottom)
+                    {
+                        scroll.ChangeView(null, bottom, null, true);
+                        stableFrames = 0;
+                    }
+                    else if (extentStable && finalContainerLoaded && lastPage.InkLoaded)
+                    {
+                        stableFrames++;
+                        if (stableFrames >= 4)
+                        {
+                            CompositionTarget.Rendering -= OnOpeningFrame;
+                            completion.TrySetResult(true);
+                        }
+                    }
+                    else
+                    {
+                        stableFrames = 0;
+                    }
+                    previousScrollableHeight = bottom;
+                }
+                CompositionTarget.Rendering += OnOpeningFrame;
+                PositionAtNotebookEnd();
+                return completion.Task;
+            }
+
+            PositionAtNotebookEnd();
+            try
+            {
+                // Keep the loading surface up until the actual destination is editable. Loading
+                // only metadata is not sufficient: the last page must own history/input first.
+                await lastPage.EnsureInkLoadedAsync();
+                if (openRevision != _notebookOpenRevision || _currentNotebook?.Id != notebook.Id) return;
+                if (!await PositionAtNotebookEndAndWaitAsync()) return;
+                if (openRevision != _notebookOpenRevision || _currentNotebook?.Id != notebook.Id) return;
+                _activeInk = lastPage.Ink;
+                RefreshHistoryActions();
                 HideEditorLoadingOverlay();
             }
-            else
+            catch (Exception exception)
             {
-                EventHandler? readyHandler = null;
-                readyHandler = (_, _) =>
-                {
-                    lastPage.Presented -= readyHandler;
-                    if (openRevision == _notebookOpenRevision && _currentNotebook?.Id == notebook.Id)
-                        HideEditorLoadingOverlay();
-                };
-                lastPage.Presented += readyHandler;
+                TraceNotebookOpen($"page {lastPage.Page.SortOrder + 1}: initial last-page load failed: {exception}");
+                if (openRevision == _notebookOpenRevision && _currentNotebook?.Id == notebook.Id)
+                    HideEditorLoadingOverlay();
             }
         }
 
@@ -2051,25 +2113,28 @@ public sealed partial class MainWindow : Window
         uint thumbPointerId = 0;
         double thumbDragStartY = 0;
         double thumbDragStartTop = 0;
-        PageView? pageAwaitingLoad = null;
-        var settledPageLoadTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(90) };
-        settledPageLoadTimer.Tick += async (_, _) =>
+        int activePageRevision = 0;
+        IEnumerable<PageView> VisiblePages()
         {
-            settledPageLoadTimer.Stop();
-            var page = pageAwaitingLoad;
-            if (page is null || !_pageViews.Contains(page)) return;
+            if (pageScrollViewer is null || _pageViews.Count == 0) yield break;
+            var pageHeight = Math.Max(1, pageScrollViewer.ViewportHeight);
+            var first = Math.Clamp((int)Math.Floor((pageScrollViewer.VerticalOffset + .5) / pageHeight), 0, _pageViews.Count - 1);
+            var last = Math.Clamp((int)Math.Floor((pageScrollViewer.VerticalOffset + pageScrollViewer.ViewportHeight - .5) / pageHeight), first, _pageViews.Count - 1);
+            for (var index = first; index <= last; index++) yield return _pageViews[index];
+        }
+        async Task LoadVisiblePageAsync(PageView page, bool makeActive, int revision)
+        {
             try
             {
                 await page.EnsureInkLoadedAsync();
-                if (!ReferenceEquals(pageAwaitingLoad, page)) return;
-                _activeInk = page.Ink;
-                RefreshHistoryActions();
+                if (makeActive && revision == activePageRevision && _pageViews.Contains(page))
+                {
+                    _activeInk = page.Ink;
+                    RefreshHistoryActions();
+                }
             }
-            catch (Exception exception)
-            {
-                TraceNotebookOpen($"page {page.Page.SortOrder + 1}: settled-page load failed: {exception}");
-            }
-        };
+            catch (Exception exception) { TraceNotebookOpen($"page {page.Page.SortOrder + 1}: visible-page load failed: {exception}"); }
+        }
         void SyncPageScrollThumb()
         {
             if (pageScrollViewer is null || scrollTrack.ActualHeight <= 0) return;
@@ -2099,17 +2164,32 @@ public sealed partial class MainWindow : Window
                 if (_pageViews.Count == 0) return;
                 var index = Math.Clamp((int)Math.Round(pageScrollViewer.VerticalOffset / Math.Max(1, pageScrollViewer.ViewportHeight)), 0, _pageViews.Count - 1);
                 var activeView = _pageViews[index];
+                var revision = ++activePageRevision;
+                _activeInk = activeView.Ink;
                 if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
+                RefreshHistoryActions();
                 SyncPageScrollThumb();
-                // During a fling, update only the cheap page chrome. Restarting this timer skips
-                // the expensive ink/photo realization for pages that merely pass through view.
-                pageAwaitingLoad = activeView;
-                settledPageLoadTimer.Stop();
-                settledPageLoadTimer.Start();
+                // Start normal editable-page loading as soon as any part of a page enters the
+                // viewport. File and JSON work can overlap; WinUI geometry remains on the UI thread.
+                foreach (var visiblePage in VisiblePages())
+                    _ = LoadVisiblePageAsync(visiblePage, ReferenceEquals(visiblePage, activeView), revision);
             };
             SyncPageScrollThumb();
         };
         scrollTrack.SizeChanged += (_, _) => SyncPageScrollThumb();
+
+        _pageList.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (_penScrollMode || pageScrollViewer is null || _pageViews.Count == 0) return;
+            var pageHeight = Math.Max(1, pageScrollViewer.ViewportHeight);
+            var documentY = pageScrollViewer.VerticalOffset + e.GetCurrentPoint(_pageList).Position.Y;
+            var index = Math.Clamp((int)Math.Floor(documentY / pageHeight), 0, _pageViews.Count - 1);
+            var pointedPage = _pageViews[index];
+            var revision = ++activePageRevision;
+            _activeInk = pointedPage.Ink;
+            RefreshHistoryActions();
+            _ = LoadVisiblePageAsync(pointedPage, makeActive: true, revision);
+        }), true);
 
         bool penPageScrolling = false;
         uint penScrollPointerId = 0;
@@ -2196,7 +2276,7 @@ public sealed partial class MainWindow : Window
             pendingPenScrollDelta = 0;
             if (Math.Abs(penScrollVelocity) >= 0.02) penScrollInertia.Start();
         }), true);
-        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); settledPageLoadTimer.Stop(); };
+        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); };
         scrollThumb.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || !scrollThumb.CapturePointer(e.Pointer)) return;
@@ -2627,10 +2707,19 @@ public sealed partial class MainWindow : Window
                 await nextView.EnsureInkLoadedAsync();
                 _activeInk = nextView.Ink;
                 if (_pageTypeButton is not null) _pageTypeButton.Content = nextView.Page.PaperStyle.ToString();
-                // Removing an item makes ItemsStackPanel preserve and clamp its own viewport.
-                // Do not issue another ChangeView here: that delayed second navigation was able
-                // to pull the scrollbar back to the bottom after the page had already reflowed.
-                _syncPageScrollThumb?.Invoke();
+                var deletedLastPage = deletedIndex >= _pageViews.Count;
+                if (deletedLastPage)
+                {
+                    // ItemsStackPanel already clamps a removed final page to the new bottom.
+                    // A second navigation here causes the visible duplicate scroll.
+                    _pageList?.UpdateLayout();
+                    _syncPageScrollThumb?.Invoke();
+                }
+                else
+                {
+                    await AnimatePageDeleteReplacementAsync(nextView);
+                }
+                RefreshHistoryActions();
             }
             // Keep the page controls visible after a delete so several pages can be removed
             // without repeatedly pulling the drawer down.
@@ -3121,11 +3210,19 @@ public sealed partial class MainWindow : Window
     private void ApplyHistoryButtonVisual(Button? button, bool available)
     {
         if (button is null) return;
+        // Keep the outlined unavailable appearance at full opacity. The shared button template
+        // dims its Disabled visual state, so block interaction directly instead of entering it.
+        button.IsEnabled = true;
+        button.IsHitTestVisible = available;
+        button.IsTabStop = available;
         button.Style = (Style)Application.Current.Resources[available ? "AccentButtonStyle" : "OutlineButtonStyle"];
         button.Background = available ? Brush(_editorAccent) : Brush("#00111110");
         button.Foreground = available ? Brush("#070706") : Brush(_editorAccent);
         button.BorderBrush = Brush(_editorAccent);
         button.BorderThickness = available ? new Thickness(0) : new Thickness(2);
+        button.Opacity = 1;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetItemStatus(
+            button, available ? "Available" : "Unavailable");
     }
 
     private Button ToolButton(string glyph, string label, InkTool tool, float iconOffsetY = -0.5f)
@@ -3255,7 +3352,12 @@ public sealed partial class MainWindow : Window
         ink.SetAccentColor(_editorAccent);
         ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
         ink.PageAtPoint = FindInkPageAtPoint;
-        ink.InkChanged += (_, _) => { ink.TagAsDirty(); _activeInk = ink; };
+        ink.InkChanged += (_, _) =>
+        {
+            ink.TagAsDirty();
+            _activeInk = ink;
+            RefreshHistoryActions();
+        };
         ink.PenActivity += (_, _) => _lastPenActivity = DateTimeOffset.UtcNow;
         ink.SelectionChanged += (_, _) =>
         {
@@ -3281,6 +3383,7 @@ public sealed partial class MainWindow : Window
         {
             if (writing) _lastPenActivity = DateTimeOffset.UtcNow;
             _activeInk = ink;
+            RefreshHistoryActions();
             if (_floatingToolbar is not null) _floatingToolbar.Visibility = Visibility.Visible;
         };
         ink.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, _) =>
@@ -3369,6 +3472,7 @@ public sealed partial class MainWindow : Window
         {
             if (!hasFinalMetrics || !view.LoadAttemptCompleted || revealStarted) return;
             revealStarted = true;
+            scaled.Opacity = 1;
             await Task.CompletedTask;
             view.NotifyPresented();
         }
@@ -3413,8 +3517,14 @@ public sealed partial class MainWindow : Window
     {
         if (renderedWidth <= 0 || renderedHeight <= 0) return;
 
-        var physicalPpi = 96d;
+        var physicalPpi = GetPhysicalPpi();
         var rasterScale = Content.XamlRoot?.RasterizationScale ?? 1d;
+        ink.SetPhysicalPaperMetrics(renderedWidth, renderedHeight, physicalPpi, rasterScale);
+    }
+
+    private double GetPhysicalPpi()
+    {
+        var physicalPpi = 96d;
         var window = WindowNative.GetWindowHandle(this);
         var deviceContext = GetDC(window);
         if (deviceContext != IntPtr.Zero)
@@ -3439,8 +3549,7 @@ public sealed partial class MainWindow : Window
                 ReleaseDC(window, deviceContext);
             }
         }
-
-        ink.SetPhysicalPaperMetrics(renderedWidth, renderedHeight, physicalPpi, rasterScale);
+        return physicalPpi;
     }
 
     private async Task AddPhotoToActivePageAsync()
@@ -3488,7 +3597,7 @@ public sealed partial class MainWindow : Window
         await view.EnsureInkLoadedAsync();
         _activeInk = view.Ink;
         if (_pageTypeButton is not null) _pageTypeButton.Content = inheritedPaperStyle.ToString();
-        ScrollToPage(view);
+        await NavigateToPageAsync(view, animate: true);
         return view;
     }
 
@@ -3686,34 +3795,55 @@ public sealed partial class MainWindow : Window
         await NormalizeAndSavePagesAsync();
         _activeInk = view.Ink;
         if (_pageTypeButton is not null) _pageTypeButton.Content = view.Page.PaperStyle.ToString();
-        ScrollToPage(view);
+        await NavigateToPageAsync(view, animate: true);
     }
 
     private void ScrollToPage(PageView view)
     {
-        if (_pageList is null) return;
+        _ = NavigateToPageAsync(view, animate: true);
+    }
 
-        // Do not call ScrollIntoView here: it jumps immediately and makes the following
-        // animated ChangeView invisible. Let layout realize the new page first, then animate
-        // the internal ScrollViewer to the page's exact viewport-sized offset.
-        _pageList.DispatcherQueue.TryEnqueue(() =>
+    private async Task NavigateToPageAsync(PageView view, bool animate)
+    {
+        if (_pageList is null || !_pageViews.Contains(view)) return;
+
+        static Task NextFrameAsync()
         {
-            if (_pageList is null) return;
-            _pageList.UpdateLayout();
-
-            _pageList.DispatcherQueue.TryEnqueue(() =>
+            var completion = new TaskCompletionSource<bool>();
+            void OnFrame(object? sender, object args)
             {
-                if (_pageList is null) return;
-                var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
-                if (scroll is null || scroll.ViewportHeight <= 0) return;
+                CompositionTarget.Rendering -= OnFrame;
+                completion.TrySetResult(true);
+            }
+            CompositionTarget.Rendering += OnFrame;
+            return completion.Task;
+        }
 
-                var index = _pageViews.IndexOf(view);
-                if (index < 0) return;
-                var target = Math.Clamp(index * scroll.ViewportHeight, 0, scroll.ScrollableHeight);
-                // disableAnimation:false gives the native smooth WinUI scrolling transition.
-                scroll.ChangeView(null, target, null, false);
-            });
-        });
+        // Let ItemsStackPanel publish the new/shrunk extent without moving the viewport. Once the
+        // extent is stable, issue exactly one ChangeView so creation can animate naturally and
+        // deletion cannot receive a delayed second scroll command.
+        double previousExtent = -1;
+        var stableFrames = 0;
+        for (var attempt = 0; attempt < 8 && stableFrames < 2; attempt++)
+        {
+            await NextFrameAsync();
+            if (_pageList is null || !_pageViews.Contains(view)) return;
+            _pageList.UpdateLayout();
+            var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
+            if (scroll is null || scroll.ViewportHeight <= 0) continue;
+            if (Math.Abs(scroll.ScrollableHeight - previousExtent) < .25) stableFrames++;
+            else stableFrames = 0;
+            previousExtent = scroll.ScrollableHeight;
+        }
+        if (_pageList is null || !_pageViews.Contains(view)) return;
+        var finalScroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
+        if (finalScroll is null || finalScroll.ViewportHeight <= 0) return;
+        var finalIndex = _pageViews.IndexOf(view);
+        var finalTarget = finalIndex == _pageViews.Count - 1
+            ? finalScroll.ScrollableHeight
+            : Math.Clamp(finalIndex * finalScroll.ViewportHeight, 0, finalScroll.ScrollableHeight);
+        finalScroll.ChangeView(null, finalTarget, null, disableAnimation: !animate);
+        _syncPageScrollThumb?.Invoke();
     }
 
     private async Task<bool> ClearOnlyPageAsync(PageView view)
@@ -3806,23 +3936,11 @@ public sealed partial class MainWindow : Window
     {
         if (_pageList is null) return;
 
+        await NavigateToPageAsync(view, animate: false);
         _pageList.UpdateLayout();
         var scroll = Descendants<ScrollViewer>(_pageList).FirstOrDefault();
         if (scroll is null || scroll.ViewportHeight <= 0)
-        {
-            ScrollToPage(view);
             return;
-        }
-
-        var index = _pageViews.IndexOf(view);
-        if (index < 0) return;
-        var target = Math.Clamp(index * scroll.ViewportHeight, 0, scroll.ScrollableHeight);
-
-        // Snap the viewport only while the deleted page is already fully faded out.
-        // The replacement page is then visually brought in from its former direction,
-        // so the layout change reads as one continuous page-removal gesture.
-        scroll.ChangeView(null, target, null, true);
-        _pageList.UpdateLayout();
 
         var element = view.Root;
         var travel = Math.Clamp(scroll.ViewportHeight * 0.12, 56, 120);
@@ -4668,6 +4786,11 @@ public sealed partial class MainWindow : Window
                 Background = Brush("#0A0A09")
             };
             _autosave = new DebouncedAutosave(() => SaveAsync());
+            _root.Loaded += async (_, _) =>
+            {
+                try { await EnsureInkLoadedAsync(); }
+                catch (Exception exception) { TraceNotebookOpen($"page {Page.SortOrder + 1}: load failed: {exception}"); }
+            };
         }
         private void EnsureVisual()
         {
@@ -4705,7 +4828,17 @@ public sealed partial class MainWindow : Window
             IsPresented = true;
             Presented?.Invoke(this, EventArgs.Empty);
         }
-        public Task EnsureInkLoadedAsync() => InkLoaded ? Task.CompletedTask : _inkLoadTask ??= LoadInkAsync();
+        public async Task EnsureInkLoadedAsync()
+        {
+            if (InkLoaded) return;
+            var load = _inkLoadTask ??= LoadInkAsync();
+            try { await load; }
+            catch
+            {
+                if (ReferenceEquals(_inkLoadTask, load)) _inkLoadTask = null;
+                throw;
+            }
+        }
         private async Task LoadInkAsync()
         {
             TraceNotebookOpen($"page {Page.SortOrder + 1}: LoadInkAsync begin");
@@ -4715,8 +4848,13 @@ public sealed partial class MainWindow : Window
             {
                 if (!_modelAlreadyLoaded)
                 {
-                    Page.Strokes = await InkFileService.LoadAsync(Page.Id);
-                    Page.Photos = await PhotoFileService.LoadAsync(Page.Id);
+                    // Ink and photo metadata are independent local files. Load them concurrently
+                    // off the UI path, then build the WinUI geometry once both models are ready.
+                    var strokesTask = InkFileService.LoadAsync(Page.Id);
+                    var photosTask = PhotoFileService.LoadAsync(Page.Id);
+                    await Task.WhenAll(strokesTask, photosTask);
+                    Page.Strokes = await strokesTask;
+                    Page.Photos = await photosTask;
                     TraceNotebookOpen($"page {Page.SortOrder + 1}: files parsed ({Page.Strokes.Count} strokes, {Page.Photos.Count} photos)");
                 }
 
@@ -4724,11 +4862,16 @@ public sealed partial class MainWindow : Window
                 if (_scaleBorder!.ActualWidth > 0 && _scaleBorder.ActualHeight > 0)
                     window.ApplyPhysicalPaperMetrics(Ink!, _scaleBorder.ActualWidth, _scaleBorder.ActualHeight);
 
-                await Ink!.RefreshInkAsync();
-                TraceNotebookOpen($"page {Page.SortOrder + 1}: ink refresh complete");
+                // RefreshInkAsync builds retained stroke geometry synchronously before its first
+                // yield. Enable input at that boundary; photo decoding can finish afterward.
+                var refreshTask = Ink!.RefreshInkAsync();
+                _scaleBorder!.Opacity = 1;
+                NotifyPresented();
                 InkLoaded = true;
                 Ink.PenInputEnabled = !window._penScrollMode;
                 Ink.IsHitTestVisible = !window._penScrollMode;
+                await refreshTask;
+                TraceNotebookOpen($"page {Page.SortOrder + 1}: ink refresh complete");
             }
             finally
             {
