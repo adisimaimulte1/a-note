@@ -2108,6 +2108,41 @@ public sealed partial class MainWindow : Window
         scrollTrack.Children.Add(thumbLayer);
         pageHost.Children.Add(scrollTrack);
         root.Children.Insert(0, pageHost);
+        var leftEdgeDeadZone = new Border
+        {
+            Width = 28,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            Background = Brush("#01000000"),
+            Translation = new System.Numerics.Vector3(0, 0, 40),
+            ManipulationMode = ManipulationModes.None
+        };
+        uint? deadZonePointerId = null;
+        leftEdgeDeadZone.PointerPressed += (_, e) =>
+        {
+            if (e.Pointer.PointerDeviceType is not (Microsoft.UI.Input.PointerDeviceType.Touch or Microsoft.UI.Input.PointerDeviceType.Pen)) return;
+            if (!leftEdgeDeadZone.CapturePointer(e.Pointer)) return;
+            deadZonePointerId = e.Pointer.PointerId;
+            e.Handled = true;
+        };
+        leftEdgeDeadZone.PointerMoved += (_, e) =>
+        {
+            if (deadZonePointerId == e.Pointer.PointerId) e.Handled = true;
+        };
+        void EndDeadZonePointer(PointerRoutedEventArgs e)
+        {
+            if (deadZonePointerId != e.Pointer.PointerId) return;
+            deadZonePointerId = null;
+            leftEdgeDeadZone.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }
+        leftEdgeDeadZone.PointerReleased += (_, e) => EndDeadZonePointer(e);
+        leftEdgeDeadZone.PointerCanceled += (_, e) => EndDeadZonePointer(e);
+        leftEdgeDeadZone.PointerCaptureLost += (_, e) =>
+        {
+            if (deadZonePointerId == e.Pointer.PointerId) deadZonePointerId = null;
+        };
+        root.Children.Add(leftEdgeDeadZone);
         ScrollViewer? pageScrollViewer = null;
         bool thumbDragging = false;
         uint thumbPointerId = 0;
@@ -2192,6 +2227,8 @@ public sealed partial class MainWindow : Window
         }), true);
 
         bool penPageScrolling = false;
+        bool ignoredEdgePointer = false;
+        uint ignoredEdgePointerId = 0;
         uint penScrollPointerId = 0;
         double penScrollLastY = 0;
         DateTimeOffset penScrollLastTime = DateTimeOffset.MinValue;
@@ -2218,6 +2255,41 @@ public sealed partial class MainWindow : Window
             penScrollVelocity *= 0.90;
             if (hitEdge) penScrollInertia.Stop();
         };
+        // The extreme left edge is a dead zone: accidental finger contact there must never pan
+        // the notebook. InkPageControl handles valid pen presses itself; an unhandled pen press
+        // in the exposed margin is discarded too while manual pen scrolling is off.
+        _pageList.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (e.Handled) return;
+            var device = e.Pointer.PointerDeviceType;
+            var position = e.GetCurrentPoint(_pageList).Position;
+            const double leftEdgeDeadZone = 28;
+            var ignoreTouchEdge = device == Microsoft.UI.Input.PointerDeviceType.Touch && position.X <= leftEdgeDeadZone;
+            var ignoreUnhandledPen = device == Microsoft.UI.Input.PointerDeviceType.Pen && !_penScrollMode;
+            if (!ignoreTouchEdge && !ignoreUnhandledPen) return;
+            if (!_pageList.CapturePointer(e.Pointer)) return;
+            ignoredEdgePointer = true;
+            ignoredEdgePointerId = e.Pointer.PointerId;
+            e.Handled = true;
+        }), true);
+        _pageList.AddHandler(UIElement.PointerMovedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (!ignoredEdgePointer || e.Pointer.PointerId != ignoredEdgePointerId) return;
+            e.Handled = true;
+        }), true);
+        void EndIgnoredEdgePointer(PointerRoutedEventArgs e)
+        {
+            if (!ignoredEdgePointer || e.Pointer.PointerId != ignoredEdgePointerId) return;
+            ignoredEdgePointer = false;
+            _pageList.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }
+        _pageList.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, e) => EndIgnoredEdgePointer(e)), true);
+        _pageList.AddHandler(UIElement.PointerCanceledEvent, new PointerEventHandler((_, e) => EndIgnoredEdgePointer(e)), true);
+        _pageList.AddHandler(UIElement.PointerCaptureLostEvent, new PointerEventHandler((_, e) =>
+        {
+            if (e.Pointer.PointerId == ignoredEdgePointerId) ignoredEdgePointer = false;
+        }), true);
         _pageList.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
         {
             // Photo manipulation/floating controls own their pointer stream. Because this handler
@@ -3272,11 +3344,19 @@ public sealed partial class MainWindow : Window
             }
             else
                 _eraserEnabled = !_eraserEnabled;
-            RefreshToolButtonVisuals();
-            RefreshSelectionAction();
-            // Paint the selected state before propagating the tool across realized pages.
-            // Dense-page selection cleanup can otherwise delay visible button feedback.
-            if (!DispatcherQueue.TryEnqueue(ApplyInputSettings)) ApplyInputSettings();
+            ApplyInputSettings();
+            // Replacing the clicked Button's Style while WinUI is still dispatching its Click
+            // can re-enter the control template and strand this toolbar's input state. Input is
+            // already live; only defer the visual transition to the next dispatcher turn.
+            if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                RefreshToolButtonVisuals();
+                RefreshSelectionAction();
+            }))
+            {
+                RefreshToolButtonVisuals();
+                RefreshSelectionAction();
+            }
         });
         button.Tag = "eraser-toggle";
         button.Style = (Style)Application.Current.Resources["OutlineButtonStyle"];
@@ -3994,18 +4074,18 @@ public sealed partial class MainWindow : Window
     {
         _syncEditorDrawerGestureHitTesting?.Invoke();
         _syncPageScrollMode?.Invoke();
+        var nextTool = _eraserEnabled ? InkTool.Eraser : _tool;
         foreach (var page in _pageViews)
         {
             if (page.Ink is not { } ink) continue;
             ink.EraserTarget = _eraseTarget;
             ink.PenInputEnabled = !_penScrollMode;
-            // In pen-scroll mode the page itself must be completely transparent to hit testing.
-            // That lets touch/pen manipulation target the ListView/ScrollViewer directly instead
-            // of getting stuck on the full-page ink Canvas. The root-level top-drawer recognizer
-            // still sees routed touch first and can take ownership only when the gesture actually
-            // qualifies as a drawer open/close gesture.
             ink.IsHitTestVisible = !_penScrollMode;
-            ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
+            // All pages receive the input mode immediately so a page reached by scrolling can
+            // accept the very first pen sample. Only the active page needs SetTool's selection
+            // cleanup/rendering; assigning Tool directly keeps the remaining updates constant-time.
+            if (ReferenceEquals(ink, _activeInk)) ink.SetTool(nextTool);
+            else ink.Tool = nextTool;
             ink.MouseDrawingEnabled = false;
         }
     }
@@ -4184,6 +4264,17 @@ public sealed partial class MainWindow : Window
             }
         }
 
+        void ApplySingleButtonLayout()
+        {
+            if (!string.IsNullOrWhiteSpace(dialog.PrimaryButtonText) || string.IsNullOrWhiteSpace(dialog.CloseButtonText)) return;
+            var close = Descendants<Button>(dialog).FirstOrDefault(button => button.Name == "CloseButton");
+            if (close is null) return;
+            close.Margin = new Thickness(0);
+            close.HorizontalAlignment = HorizontalAlignment.Stretch;
+            Grid.SetColumn(close, 0);
+            Grid.SetColumnSpan(close, 2);
+        }
+
         dialog.Loaded += (_, _) =>
         {
             var titleHost = Descendants<ContentControl>(dialog).FirstOrDefault(control => control.Name == "Title");
@@ -4216,13 +4307,19 @@ public sealed partial class MainWindow : Window
                 }
             }
             ApplyEditorDialogAccent();
+            ApplySingleButtonLayout();
         };
         // ContentDialog creates its popup buttons late. Loaded can run before those template
         // parts exist, so reapply after Opened and one dispatcher turn later.
         dialog.Opened += (_, _) =>
         {
             ApplyEditorDialogAccent();
-            dialog.DispatcherQueue.TryEnqueue(ApplyEditorDialogAccent);
+            ApplySingleButtonLayout();
+            dialog.DispatcherQueue.TryEnqueue(() =>
+            {
+                ApplyEditorDialogAccent();
+                ApplySingleButtonLayout();
+            });
         };
         return dialog;
     }

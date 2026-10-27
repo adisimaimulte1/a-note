@@ -57,7 +57,9 @@ public static class PdfExportService
     private static async Task<byte[]> RenderJpegAsync(NotePage page, CancellationToken cancellationToken)
     {
         var pixels = new byte[ImageWidth * ImageHeight * 4];
-        Fill(pixels, 10, 10, 9, 255);
+        // The editor is intentionally dark, while exported notebooks use a paper-friendly
+        // light palette: near-white stock, pale rules, and black pen ink.
+        Fill(pixels, 250, 250, 247, 255);
         var scaleX = ImageWidth / InkPageControl.PaperWidth;
         var scaleY = ImageHeight / InkPageControl.PaperHeight;
         DrawPaper(pixels, page.PaperStyle, scaleX, scaleY);
@@ -177,7 +179,7 @@ public static class PdfExportService
     {
         if (style == PaperStyle.Blank) return;
         // Keep the pattern subtle, but strong enough to survive JPEG compression in the PDF.
-        var (r, g, b) = ((byte)58, (byte)58, (byte)54);
+        var (r, g, b) = ((byte)211, (byte)213, (byte)210);
         var lineWidth = Math.Max(1.5, (scaleX + scaleY) / 2);
         if (style == PaperStyle.Ruled || style == PaperStyle.Grid)
         {
@@ -199,7 +201,7 @@ public static class PdfExportService
     private static void DrawStroke(byte[] canvas, InkStrokeData stroke, double scaleX, double scaleY)
     {
         if (stroke.Points.Count == 0) return;
-        var color = stroke.Tool == "highlighter" ? ParseColor(stroke.Color) : ((byte)239, (byte)239, (byte)234);
+        var color = stroke.Tool == "highlighter" ? ParseColor(stroke.Color) : ((byte)20, (byte)20, (byte)19);
         var alpha = stroke.Tool == "highlighter" ? (byte)220 : (byte)255;
         var width = Math.Max(1.2, stroke.Width * (stroke.Tool == "highlighter" ? 1 : 1.15) * (scaleX + scaleY) / 2);
         for (var index = 1; index < stroke.Points.Count; index++)
