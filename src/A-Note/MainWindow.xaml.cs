@@ -30,6 +30,9 @@ public sealed partial class MainWindow : Window
     private const uint WmGetMinMaxInfo = 0x0024;
     private const uint WmClose = 0x0010;
     private const uint WmSysCommand = 0x0112;
+    private const uint WmTabletQuerySystemGestureStatus = 0x02CC;
+    private const int TabletEnableMultitouchData = 0x01000000;
+    private const string TabletPenServiceProperty = "MicrosoftTabletPenServiceProperty";
     private const long ScMinimize = 0xF020;
     private const long ScClose = 0xF060;
     private const uint MfByCommand = 0x00000000;
@@ -44,11 +47,13 @@ public sealed partial class MainWindow : Window
     private ListView? _pageList;
     private readonly ObservableCollection<PageView> _pageViews = [];
     private double _pageViewportHeight;
-    private Border? _floatingToolbar;
+    private FrameworkElement? _floatingToolbar;
     private Button? _pageTypeButton;
     private Button? _undoButton;
     private Button? _redoButton;
     private Button? _scrollToolButton;
+    private Border? _eraserSizePanel;
+    private Slider? _eraserSizeSlider;
     private Button? _exportButton;
     private Button? _windowLockButton;
     private Grid? _editorLoadingOverlay;
@@ -59,6 +64,7 @@ public sealed partial class MainWindow : Window
     private Action? _hideEditorDrawer;
     private Action? _syncEditorDrawerGestureHitTesting;
     private Action? _syncPageScrollMode;
+    private Action<bool>? _setPageScrollLocked;
     private TextBox? _searchBox;
     private ListView? _libraryList;
     private Grid? _libraryScrollTrack;
@@ -81,6 +87,8 @@ public sealed partial class MainWindow : Window
     private InkTool _tool = InkTool.Pen;
     private InkTool _eraseTarget = InkTool.Pen;
     private bool _eraserEnabled;
+    private double _eraserDiameter = 32;
+    private string _penColor = "#EFEFEA";
     private AppSettings _settings = new();
     private AppWindow? _appWindow;
     private readonly SubclassProc _windowSubclass;
@@ -259,6 +267,12 @@ public sealed partial class MainWindow : Window
         var hwnd = WindowNative.GetWindowHandle(this);
         if (!_windowSubclassInstalled)
             _windowSubclassInstalled = SetWindowSubclass(hwnd, _windowSubclass, new UIntPtr(1), UIntPtr.Zero);
+        // The legacy tablet service defaults to a pen-first input stream and can discard touch
+        // before WinUI ever creates a PointerRoutedEvent. Opt this HWND into simultaneous touch
+        // data so controls outside the ink surface (notably the eraser-size slider) can receive
+        // a finger while a pen is in range. The query response below covers dynamic requests;
+        // the HWND property makes the policy effective from the first touch-down.
+        SetProp(hwnd, TabletPenServiceProperty, new IntPtr(TabletEnableMultitouchData));
         _appWindow = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(hwnd));
         try
         {
@@ -2108,41 +2122,6 @@ public sealed partial class MainWindow : Window
         scrollTrack.Children.Add(thumbLayer);
         pageHost.Children.Add(scrollTrack);
         root.Children.Insert(0, pageHost);
-        var leftEdgeDeadZone = new Border
-        {
-            Width = 28,
-            HorizontalAlignment = HorizontalAlignment.Left,
-            VerticalAlignment = VerticalAlignment.Stretch,
-            Background = Brush("#01000000"),
-            Translation = new System.Numerics.Vector3(0, 0, 40),
-            ManipulationMode = ManipulationModes.None
-        };
-        uint? deadZonePointerId = null;
-        leftEdgeDeadZone.PointerPressed += (_, e) =>
-        {
-            if (e.Pointer.PointerDeviceType is not (Microsoft.UI.Input.PointerDeviceType.Touch or Microsoft.UI.Input.PointerDeviceType.Pen)) return;
-            if (!leftEdgeDeadZone.CapturePointer(e.Pointer)) return;
-            deadZonePointerId = e.Pointer.PointerId;
-            e.Handled = true;
-        };
-        leftEdgeDeadZone.PointerMoved += (_, e) =>
-        {
-            if (deadZonePointerId == e.Pointer.PointerId) e.Handled = true;
-        };
-        void EndDeadZonePointer(PointerRoutedEventArgs e)
-        {
-            if (deadZonePointerId != e.Pointer.PointerId) return;
-            deadZonePointerId = null;
-            leftEdgeDeadZone.ReleasePointerCapture(e.Pointer);
-            e.Handled = true;
-        }
-        leftEdgeDeadZone.PointerReleased += (_, e) => EndDeadZonePointer(e);
-        leftEdgeDeadZone.PointerCanceled += (_, e) => EndDeadZonePointer(e);
-        leftEdgeDeadZone.PointerCaptureLost += (_, e) =>
-        {
-            if (deadZonePointerId == e.Pointer.PointerId) deadZonePointerId = null;
-        };
-        root.Children.Add(leftEdgeDeadZone);
         ScrollViewer? pageScrollViewer = null;
         bool thumbDragging = false;
         uint thumbPointerId = 0;
@@ -2255,9 +2234,24 @@ public sealed partial class MainWindow : Window
             penScrollVelocity *= 0.90;
             if (hitEdge) penScrollInertia.Stop();
         };
-        // The extreme left edge is a dead zone: accidental finger contact there must never pan
-        // the notebook. InkPageControl handles valid pen presses itself; an unhandled pen press
-        // in the exposed margin is discarded too while manual pen scrolling is off.
+        _setPageScrollLocked = locked =>
+        {
+            // A pen stroke owns the gesture until pen-up, even when its captured pointer moves
+            // beyond the paper. Disabling the ScrollViewer prevents that excursion from being
+            // reinterpreted as notebook panning by Direct Manipulation.
+            if (locked)
+            {
+                penScrollFrame.Stop();
+                penScrollInertia.Stop();
+                pendingPenScrollDelta = 0;
+                penScrollVelocity = 0;
+            }
+            _pageList?.SetValue(
+                ScrollViewer.VerticalScrollModeProperty,
+                locked ? ScrollMode.Disabled : ScrollMode.Enabled);
+        };
+        // Ignore accidental finger contact at the extreme left edge without placing an overlay
+        // above the page. Pen input must remain available all the way to the paper boundary.
         _pageList.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
         {
             if (e.Handled) return;
@@ -2348,7 +2342,12 @@ public sealed partial class MainWindow : Window
             pendingPenScrollDelta = 0;
             if (Math.Abs(penScrollVelocity) >= 0.02) penScrollInertia.Start();
         }), true);
-        root.Unloaded += (_, _) => { penScrollFrame.Stop(); penScrollInertia.Stop(); };
+        root.Unloaded += (_, _) =>
+        {
+            penScrollFrame.Stop();
+            penScrollInertia.Stop();
+            _setPageScrollLocked = null;
+        };
         scrollThumb.PointerPressed += (_, e) =>
         {
             if (pageScrollViewer is null || !scrollThumb.CapturePointer(e.Pointer)) return;
@@ -2938,16 +2937,16 @@ public sealed partial class MainWindow : Window
             // Scroll mode uses the dedicated 126 px overlay above. Do not also run the
             // fall-through candidate recognizer or it can fight native touch scrolling.
             if (_penScrollMode) return;
+            var y = e.GetCurrentPoint(root).Position.Y;
+            if (y > 126) return;
             if (DateTimeOffset.UtcNow - _lastPenActivity < TimeSpan.FromMilliseconds(2500))
             {
-                // Palm rejection while the pen is hovering/active. This touch is genuinely
-                // ignored; unlike a normal top-edge touch, it must not become page scrolling.
+                // Palm rejection applies only to the top drawer gesture strip. Controls elsewhere
+                // (notably the eraser-size slider) must remain touchable while the pen is hovering.
                 e.Handled = true;
                 return;
             }
 
-            var y = e.GetCurrentPoint(root).Position.Y;
-            if (y > 126) return;
             if (drawerOpen && y <= drawerPanelHeight) return; // actual toolbar buttons win
 
             touchDrawerCandidate = true;
@@ -3065,6 +3064,49 @@ public sealed partial class MainWindow : Window
 
         _floatingToolbar = BuildToolbar();
         root.Children.Add(_floatingToolbar);
+        _eraserSizePanel = BuildEraserSizeControl();
+        root.Children.Add(_eraserSizePanel);
+        uint? eraserSliderTouchId = null;
+        void UpdateEraserSliderFromRoot(PointerRoutedEventArgs e)
+        {
+            if (_eraserSizeSlider is null) return;
+            var point = e.GetCurrentPoint(_eraserSizeSlider).Position;
+            var amount = 1d - Math.Clamp(point.Y / Math.Max(1d, _eraserSizeSlider.ActualHeight), 0d, 1d);
+            _eraserSizeSlider.Value = _eraserSizeSlider.Minimum +
+                amount * (_eraserSizeSlider.Maximum - _eraserSizeSlider.Minimum);
+        }
+        root.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (e.Pointer.PointerDeviceType != Microsoft.UI.Input.PointerDeviceType.Touch ||
+                _eraserSizePanel?.Visibility != Visibility.Visible || _eraserSizeSlider is null) return;
+            var point = e.GetCurrentPoint(_eraserSizePanel).Position;
+            if (point.X < 0 || point.Y < 0 ||
+                point.X > _eraserSizePanel.ActualWidth || point.Y > _eraserSizePanel.ActualHeight) return;
+            if (!root.CapturePointer(e.Pointer)) return;
+            eraserSliderTouchId = e.Pointer.PointerId;
+            UpdateEraserSliderFromRoot(e);
+            e.Handled = true;
+        }), true);
+        root.AddHandler(UIElement.PointerMovedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (eraserSliderTouchId != e.Pointer.PointerId) return;
+            UpdateEraserSliderFromRoot(e);
+            e.Handled = true;
+        }), true);
+        void EndEraserSliderTouch(PointerRoutedEventArgs e, bool update)
+        {
+            if (eraserSliderTouchId != e.Pointer.PointerId) return;
+            if (update) UpdateEraserSliderFromRoot(e);
+            eraserSliderTouchId = null;
+            root.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }
+        root.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, e) => EndEraserSliderTouch(e, true)), true);
+        root.AddHandler(UIElement.PointerCanceledEvent, new PointerEventHandler((_, e) => EndEraserSliderTouch(e, false)), true);
+        root.AddHandler(UIElement.PointerCaptureLostEvent, new PointerEventHandler((_, e) =>
+        {
+            if (eraserSliderTouchId == e.Pointer.PointerId) eraserSliderTouchId = null;
+        }), true);
 
         // Use a lightweight accent-colored arc instead of ProgressRing. A second active native
         // ProgressRing in this incoming tree can make WinUI fail-fast while the previous loading
@@ -3130,12 +3172,13 @@ public sealed partial class MainWindow : Window
         return root;
     }
 
-    private Border BuildToolbar()
+    private FrameworkElement BuildToolbar()
     {
         var tools = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5 };
         tools.Children.Add(ToolButton("\uED63", "Pen", InkTool.Pen, iconOffsetY: 1f));
         tools.Children.Add(ToolButton("\uE7E6", "Highlighter", InkTool.Highlighter, iconOffsetY: 1f));
         tools.Children.Add(EraserToggleButton("\uED60", "Eraser", iconOffsetY: 1.1f));
+        tools.Children.Add(BuildPenColorButton());
         tools.Children.Add(ToolButton("\uF407", "Select", InkTool.Lasso, iconOffsetY: 0.9f));
         _scrollToolButton = ScrollToolButton("\uECE9", "Scroll with pen", iconOffsetX: 0f, iconOffsetY: 0.9f);
         tools.Children.Add(_scrollToolButton);
@@ -3194,6 +3237,195 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private Border BuildEraserSizeControl()
+    {
+        var slider = new Slider
+        {
+            Minimum = 8,
+            Maximum = 80,
+            Value = _eraserDiameter,
+            Orientation = Orientation.Vertical,
+            Height = 118,
+            StepFrequency = 2,
+            IsThumbToolTipEnabled = false,
+            Foreground = Brush(_editorAccent)
+        };
+        _eraserSizeSlider = slider;
+        var accentBrush = Brush(_editorAccent);
+        var trackBrush = Brush("#4A4A46");
+        slider.Resources["SliderTrackFill"] = trackBrush;
+        slider.Resources["SliderTrackFillPointerOver"] = trackBrush;
+        slider.Resources["SliderTrackFillPressed"] = trackBrush;
+        slider.Resources["SliderTrackValueFill"] = accentBrush;
+        slider.Resources["SliderTrackValueFillPointerOver"] = accentBrush;
+        slider.Resources["SliderTrackValueFillPressed"] = accentBrush;
+        slider.Resources["SliderThumbBackground"] = accentBrush;
+        slider.Resources["SliderThumbBackgroundPointerOver"] = accentBrush;
+        slider.Resources["SliderThumbBackgroundPressed"] = accentBrush;
+        var transparentBrush = new SolidColorBrush(Colors.Transparent);
+        slider.Resources["SliderContainerBackground"] = transparentBrush;
+        slider.Resources["SliderContainerBackgroundPointerOver"] = transparentBrush;
+        slider.Resources["SliderContainerBackgroundPressed"] = transparentBrush;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(slider, "Eraser size");
+        slider.ValueChanged += (_, e) =>
+        {
+            _eraserDiameter = e.NewValue;
+            foreach (var page in _pageViews)
+                if (page.Ink is { } ink) ink.EraserDiameter = _eraserDiameter;
+        };
+        uint? sliderPointerId = null;
+        void SetSliderFromPointer(PointerRoutedEventArgs e)
+        {
+            var point = e.GetCurrentPoint(slider).Position;
+            var amount = 1d - Math.Clamp(point.Y / Math.Max(1d, slider.ActualHeight), 0d, 1d);
+            slider.Value = slider.Minimum + amount * (slider.Maximum - slider.Minimum);
+        }
+        slider.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (e.Pointer.PointerDeviceType != Microsoft.UI.Input.PointerDeviceType.Pen) return;
+            if (!slider.CapturePointer(e.Pointer)) return;
+            sliderPointerId = e.Pointer.PointerId;
+            SetSliderFromPointer(e);
+            e.Handled = true;
+        }), true);
+        slider.AddHandler(UIElement.PointerMovedEvent, new PointerEventHandler((_, e) =>
+        {
+            if (sliderPointerId != e.Pointer.PointerId) return;
+            SetSliderFromPointer(e);
+            e.Handled = true;
+        }), true);
+        void EndSliderPointer(PointerRoutedEventArgs e)
+        {
+            if (sliderPointerId != e.Pointer.PointerId) return;
+            SetSliderFromPointer(e);
+            sliderPointerId = null;
+            slider.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }
+        slider.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler((_, e) => EndSliderPointer(e)), true);
+        slider.AddHandler(UIElement.PointerCanceledEvent, new PointerEventHandler((_, e) =>
+        {
+            if (sliderPointerId != e.Pointer.PointerId) return;
+            sliderPointerId = null;
+            slider.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }), true);
+        slider.AddHandler(UIElement.PointerCaptureLostEvent, new PointerEventHandler((_, e) =>
+        {
+            if (sliderPointerId == e.Pointer.PointerId) sliderPointerId = null;
+        }), true);
+        var valueLabel = new TextBlock
+        {
+            Text = $"{Math.Round(_eraserDiameter):0}",
+            FontSize = 12,
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+            Foreground = Brush(_editorAccent),
+            HorizontalAlignment = HorizontalAlignment.Center
+        };
+        slider.ValueChanged += (_, e) => valueLabel.Text = $"{Math.Round(e.NewValue):0}";
+        var content = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Center };
+        content.Children.Add(new FontIcon
+        {
+            Glyph = "\uED60",
+            FontFamily = new FontFamily("Segoe Fluent Icons"),
+            FontSize = 15,
+            Foreground = Brush(_editorAccent),
+            HorizontalAlignment = HorizontalAlignment.Center
+        });
+        content.Children.Add(slider);
+        content.Children.Add(valueLabel);
+        return new Border
+        {
+            Child = content,
+            Background = Brush("#F0111110"),
+            BorderBrush = Brush(_editorAccent),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(8, 8, 8, 7),
+            Visibility = Visibility.Collapsed,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+            // The page ends before the 12 px scroll rail. Keep the whole selector slightly
+            // inside that paper edge rather than aligning it to the window boundary.
+            Margin = new Thickness(0, 0, 40, 0),
+            Translation = new System.Numerics.Vector3(0, 0, 24)
+        };
+    }
+
+    private Button BuildPenColorButton()
+    {
+        var button = ActionButton("", (_, _) => { });
+        button.Width = 38;
+        button.Height = 36;
+        button.MinWidth = 0;
+        button.MinHeight = 0;
+        button.Padding = new Thickness(0);
+        button.Content = CenteredToolIcon("\uE790", offsetY: 1f);
+        button.Style = (Style)Application.Current.Resources["OutlineButtonStyle"];
+        button.Foreground = Brush(_editorAccent);
+        button.BorderBrush = Brush(_editorAccent);
+        button.BorderThickness = new Thickness(2);
+        ToolTipService.SetToolTip(button, "Writing color");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, "Choose writing color");
+
+        var picker = new AccentPickerControl(
+            ColorFromHex(_penColor),
+            new[]
+            {
+                ColorFromHex("#EFEFEA"), ColorFromHex(_editorAccent), ColorFromHex("#56CCF2"),
+                ColorFromHex("#9B8CFF"), ColorFromHex("#FF6B8A"), ColorFromHex("#7DDE92")
+            },
+            panelBorderBrush: Brush(_editorAccent),
+            panelBorderThickness: new Thickness(1));
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(picker, "Writing color picker");
+        var flyoutContent = new Border
+        {
+            Background = new SolidColorBrush(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0, 0, 0, 20),
+            Child = picker
+        };
+        var flyout = new Flyout
+        {
+            Content = flyoutContent,
+            Placement = FlyoutPlacementMode.Top,
+            ShouldConstrainToRootBounds = true,
+            FlyoutPresenterStyle = (Style)Microsoft.UI.Xaml.Markup.XamlReader.Load("""
+                <Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="FlyoutPresenter">
+                    <Setter Property="Padding" Value="0"/>
+                    <Setter Property="Background" Value="Transparent"/>
+                    <Setter Property="BorderThickness" Value="0"/>
+                    <Setter Property="CornerRadius" Value="0"/>
+                    <Setter Property="Margin" Value="0"/>
+                    <Setter Property="IsDefaultShadowEnabled" Value="False"/>
+                </Style>
+                """)
+        };
+        void ApplyColorButtonState(bool active)
+        {
+            button.Style = (Style)Application.Current.Resources[active ? "AccentButtonStyle" : "OutlineButtonStyle"];
+            button.Background = active ? Brush(_editorAccent) : Brush("#00111110");
+            button.Foreground = active ? Brush("#070706") : Brush(_editorAccent);
+            button.BorderBrush = Brush(_editorAccent);
+            button.BorderThickness = active ? new Thickness(0) : new Thickness(2);
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetItemStatus(button, active ? "Open" : "Closed");
+        }
+        flyout.Opened += (_, _) =>
+        {
+            ApplyColorButtonState(true);
+        };
+        flyout.Closed += (_, _) =>
+        {
+            var color = picker.SelectedColor;
+            _penColor = $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+            foreach (var page in _pageViews)
+                if (page.Ink is { } ink) ink.PenColor = _penColor;
+            ApplyColorButtonState(false);
+        };
+        button.Flyout = flyout;
+        return button;
+    }
+
     private void SetWindowInteractionLocked(bool locked)
     {
         _windowInteractionLocked = locked;
@@ -3242,6 +3474,8 @@ public sealed partial class MainWindow : Window
     private void RefreshToolButtonVisuals()
     {
         if (_floatingToolbar is null) return;
+        if (_eraserSizePanel is not null)
+            _eraserSizePanel.Visibility = _eraserEnabled ? Visibility.Visible : Visibility.Collapsed;
         foreach (var candidate in Descendants<Button>(_floatingToolbar).Where(x => x.Tag is InkTool || Equals(x.Tag, "eraser-toggle") || Equals(x.Tag, "scroll-toggle")))
         {
             bool selected;
@@ -3427,7 +3661,9 @@ public sealed partial class MainWindow : Window
             MouseDrawingEnabled = false,
             PenInputEnabled = !_penScrollMode,
             HighlighterColor = _editorAccent,
-            EraserTarget = _eraseTarget
+            EraserTarget = _eraseTarget,
+            PenColor = _penColor,
+            EraserDiameter = _eraserDiameter
         };
         ink.SetAccentColor(_editorAccent);
         ink.SetTool(_eraserEnabled ? InkTool.Eraser : _tool);
@@ -3462,6 +3698,7 @@ public sealed partial class MainWindow : Window
         ink.WritingStateChanged += (_, writing) =>
         {
             if (writing) _lastPenActivity = DateTimeOffset.UtcNow;
+            _setPageScrollLocked?.Invoke(writing);
             _activeInk = ink;
             RefreshHistoryActions();
             if (_floatingToolbar is not null) _floatingToolbar.Visibility = Visibility.Visible;
@@ -4079,6 +4316,8 @@ public sealed partial class MainWindow : Window
         {
             if (page.Ink is not { } ink) continue;
             ink.EraserTarget = _eraseTarget;
+            ink.PenColor = _penColor;
+            ink.EraserDiameter = _eraserDiameter;
             ink.PenInputEnabled = !_penScrollMode;
             ink.IsHitTestVisible = !_penScrollMode;
             // All pages receive the input mode immediately so a page reached by scrolling can
@@ -4182,7 +4421,7 @@ public sealed partial class MainWindow : Window
         {
             MinHeight = 0,
             VerticalAlignment = VerticalAlignment.Top,
-            Margin = compact ? new Thickness(0, 0, 0, -18) : new Thickness(0)
+            Margin = new Thickness(0)
         };
         contentHost.Children.Add(content);
         contentHost.Children.Add(focusSink);
@@ -4272,7 +4511,7 @@ public sealed partial class MainWindow : Window
             close.Margin = new Thickness(0);
             close.HorizontalAlignment = HorizontalAlignment.Stretch;
             Grid.SetColumn(close, 0);
-            Grid.SetColumnSpan(close, 2);
+            Grid.SetColumnSpan(close, 3);
         }
 
         dialog.Loaded += (_, _) =>
@@ -4393,6 +4632,7 @@ public sealed partial class MainWindow : Window
     private sealed class AccentPickerControl : UserControl
     {
         private readonly Border _preview;
+        private readonly SolidColorBrush _previewBrush;
         private readonly TextBox _hexInput;
         private readonly Grid _colorField;
         private readonly Microsoft.UI.Xaml.Shapes.Ellipse _indicator;
@@ -4406,13 +4646,18 @@ public sealed partial class MainWindow : Window
 
         public Color SelectedColor => _selectedColor;
 
-        public AccentPickerControl(Color initialColor, IReadOnlyList<Color> usedColors)
+        public AccentPickerControl(
+            Color initialColor,
+            IReadOnlyList<Color> usedColors,
+            Brush? panelBorderBrush = null,
+            Thickness? panelBorderThickness = null)
         {
             HorizontalAlignment = HorizontalAlignment.Stretch;
             MinWidth = 420;
             IsTabStop = false;
 
-            _preview = new Border { Width = 34, Height = 34, CornerRadius = new CornerRadius(3), Background = new SolidColorBrush(initialColor), BorderBrush = Brush("#F4F4F2"), BorderThickness = new Thickness(2) };
+            _previewBrush = new SolidColorBrush(initialColor);
+            _preview = new Border { Width = 34, Height = 34, CornerRadius = new CornerRadius(3), Background = _previewBrush, BorderBrush = Brush("#F4F4F2"), BorderThickness = new Thickness(2) };
             _hexInput = new NoClearTextBox
             {
                 Text = $"{initialColor.R:X2}{initialColor.G:X2}{initialColor.B:X2}",
@@ -4429,6 +4674,11 @@ public sealed partial class MainWindow : Window
                 FontWeight = Microsoft.UI.Text.FontWeights.Bold,
                 VerticalContentAlignment = VerticalAlignment.Center
             };
+            if (panelBorderBrush is not null)
+            {
+                _hexInput.Resources["TextControlBorderBrushFocused"] = panelBorderBrush;
+                _hexInput.Resources["TextControlBorderBrushPointerOver"] = panelBorderBrush;
+            }
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(_hexInput, "Hex color");
             var summary = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
             summary.Children.Add(_preview);
@@ -4518,9 +4768,9 @@ public sealed partial class MainWindow : Window
             Content = new Border
             {
                 Background = Brush("#111110"),
-                BorderBrush = Brush("#2D2D2A"),
-                BorderThickness = new Thickness(2),
-                CornerRadius = new CornerRadius(3),
+                BorderBrush = panelBorderBrush ?? Brush("#2D2D2A"),
+                BorderThickness = panelBorderThickness ?? new Thickness(2),
+                CornerRadius = new CornerRadius(4),
                 Padding = new Thickness(14),
                 Child = layout
             };
@@ -4544,7 +4794,7 @@ public sealed partial class MainWindow : Window
                 return;
 
             _capturedPointerId = e.Pointer.PointerId;
-            UpdateColorFromPointer(e);
+            UpdateColorFromPointer(e, updateHex: true);
             e.Handled = true;
         }
 
@@ -4553,7 +4803,9 @@ public sealed partial class MainWindow : Window
             if (_capturedPointerId != e.Pointer.PointerId)
                 return;
 
-            UpdateColorFromPointer(e);
+            // TextBox layout and text services are relatively expensive. Keep the drag path to
+            // the preview brush and indicator, then synchronize the hex field at the boundary.
+            UpdateColorFromPointer(e, updateHex: false);
             e.Handled = true;
         }
 
@@ -4562,7 +4814,7 @@ public sealed partial class MainWindow : Window
             if (sender is not Border field || _capturedPointerId != e.Pointer.PointerId)
                 return;
 
-            UpdateColorFromPointer(e);
+            UpdateColorFromPointer(e, updateHex: true);
             _capturedPointerId = null;
             field.ReleasePointerCapture(e.Pointer);
             e.Handled = true;
@@ -4584,7 +4836,7 @@ public sealed partial class MainWindow : Window
                 _capturedPointerId = null;
         }
 
-        private void UpdateColorFromPointer(PointerRoutedEventArgs e)
+        private void UpdateColorFromPointer(PointerRoutedEventArgs e, bool updateHex)
         {
             var point = e.GetCurrentPoint(_colorField).Position;
             var width = Math.Max(1, _colorField.ActualWidth);
@@ -4596,22 +4848,25 @@ public sealed partial class MainWindow : Window
             _hue = _huePosition * 360d;
             _saturation = 1;
             _value = 1 - (y / height);
-            UpdateColor();
+            UpdateColor(updateHex);
         }
 
-        private void UpdateColor()
+        private void UpdateColor(bool updateHex = true)
         {
             _selectedColor = HsvToRgb(_hue, _saturation, _value);
-            _preview.Background = new SolidColorBrush(_selectedColor);
+            _previewBrush.Color = _selectedColor;
 
-            var hex = $"{_selectedColor.R:X2}{_selectedColor.G:X2}{_selectedColor.B:X2}";
-            if (!string.Equals(_hexInput.Text, hex, StringComparison.OrdinalIgnoreCase))
+            if (updateHex)
             {
-                _updatingHex = true;
-                _hexInput.TextChanged -= HexInputTextChanged;
-                _hexInput.Text = hex;
-                _hexInput.TextChanged += HexInputTextChanged;
-                _updatingHex = false;
+                var hex = $"{_selectedColor.R:X2}{_selectedColor.G:X2}{_selectedColor.B:X2}";
+                if (!string.Equals(_hexInput.Text, hex, StringComparison.OrdinalIgnoreCase))
+                {
+                    _updatingHex = true;
+                    _hexInput.TextChanged -= HexInputTextChanged;
+                    _hexInput.Text = hex;
+                    _hexInput.TextChanged += HexInputTextChanged;
+                    _updatingHex = false;
+                }
             }
 
             PositionIndicator();
@@ -4650,7 +4905,7 @@ public sealed partial class MainWindow : Window
             }
             _saturation = hsv.Saturation;
             _value = hsv.Value;
-            _preview.Background = new SolidColorBrush(_selectedColor);
+            _previewBrush.Color = _selectedColor;
 
             if (updateHex)
             {
@@ -4762,6 +5017,9 @@ public sealed partial class MainWindow : Window
 
     private IntPtr WindowSubclassProc(IntPtr window, uint message, IntPtr wParam, IntPtr lParam, UIntPtr subclassId, UIntPtr referenceData)
     {
+        if (message == WmTabletQuerySystemGestureStatus)
+            return new IntPtr(TabletEnableMultitouchData);
+
         if (_windowInteractionLocked)
         {
             if (message == WmClose) return IntPtr.Zero;
@@ -4814,6 +5072,10 @@ public sealed partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr window);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetProp(IntPtr window, string propertyName, IntPtr data);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetSystemMenu(IntPtr window, bool revert);
