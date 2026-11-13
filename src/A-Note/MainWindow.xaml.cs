@@ -2116,6 +2116,7 @@ public sealed partial class MainWindow : Window
             Width = 8, Height = 48, Background = editorAccent, CornerRadius = new CornerRadius(4),
             HorizontalAlignment = HorizontalAlignment.Center
         };
+        Canvas.SetLeft(scrollThumb, 2);
         var thumbLayer = new Canvas { HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
         thumbLayer.Children.Add(scrollThumb);
         scrollTrack.Children.Add(trackBackground);
@@ -2127,7 +2128,9 @@ public sealed partial class MainWindow : Window
         uint thumbPointerId = 0;
         double thumbDragStartY = 0;
         double thumbDragStartTop = 0;
+        double scrollThumbTop = 0;
         int activePageRevision = 0;
+        int activePageIndex = -1;
         IEnumerable<PageView> VisiblePages()
         {
             if (pageScrollViewer is null || _pageViews.Count == 0) yield break;
@@ -2163,9 +2166,13 @@ public sealed partial class MainWindow : Window
             trackBackground.Visibility = visibility;
             var travel = Math.Max(0, trackHeight - thumbHeight);
             var top = scrollable <= 0 ? 0 : Math.Clamp(pageScrollViewer.VerticalOffset / scrollable * travel, 0, travel);
-            Canvas.SetLeft(scrollThumb, 2);
-            if (double.IsNaN(Canvas.GetTop(scrollThumb)) || Math.Abs(Canvas.GetTop(scrollThumb) - top) > 0.25)
-                Canvas.SetTop(scrollThumb, top);
+            if (Math.Abs(scrollThumbTop - top) > 0.25)
+            {
+                scrollThumbTop = top;
+                // Translation is compositor-backed. Canvas.Top would invalidate arrange on every
+                // ViewChanged frame and compete with the page surfaces for UI-thread time.
+                scrollThumb.Translation = new Vector3(0, (float)top, 0);
+            }
         }
         _syncPageScrollThumb = SyncPageScrollThumb;
         _syncPageScrollMode = null;
@@ -2178,15 +2185,28 @@ public sealed partial class MainWindow : Window
                 if (_pageViews.Count == 0) return;
                 var index = Math.Clamp((int)Math.Round(pageScrollViewer.VerticalOffset / Math.Max(1, pageScrollViewer.ViewportHeight)), 0, _pageViews.Count - 1);
                 var activeView = _pageViews[index];
-                var revision = ++activePageRevision;
-                _activeInk = activeView.Ink;
-                if (_pageTypeButton is not null) _pageTypeButton.Content = activeView.Page.PaperStyle.ToString();
-                RefreshHistoryActions();
                 SyncPageScrollThumb();
+                // Native scrolling raises ViewChanged for every compositor step. Re-templating
+                // toolbar buttons and assigning identical content on all of those frames causes
+                // avoidable layout/render work; active-page UI only changes at page boundaries.
+                if (index != activePageIndex)
+                {
+                    activePageIndex = index;
+                    ++activePageRevision;
+                    _activeInk = activeView.Ink;
+                    var paperStyle = activeView.Page.PaperStyle.ToString();
+                    if (_pageTypeButton is not null && !Equals(_pageTypeButton.Content, paperStyle))
+                        _pageTypeButton.Content = paperStyle;
+                    RefreshHistoryActions();
+                    if (!activeView.InkLoaded)
+                        _ = LoadVisiblePageAsync(activeView, makeActive: true, activePageRevision);
+                }
+
                 // Start normal editable-page loading as soon as any part of a page enters the
-                // viewport. File and JSON work can overlap; WinUI geometry remains on the UI thread.
+                // viewport. Each page is queued once; repeated ViewChanged frames stay cheap.
                 foreach (var visiblePage in VisiblePages())
-                    _ = LoadVisiblePageAsync(visiblePage, ReferenceEquals(visiblePage, activeView), revision);
+                    if (!visiblePage.InkLoadStarted)
+                        _ = LoadVisiblePageAsync(visiblePage, ReferenceEquals(visiblePage, activeView), activePageRevision);
             };
             SyncPageScrollThumb();
         };
@@ -2354,8 +2374,7 @@ public sealed partial class MainWindow : Window
             thumbDragging = true;
             thumbPointerId = e.Pointer.PointerId;
             thumbDragStartY = e.GetCurrentPoint(scrollTrack).Position.Y;
-            thumbDragStartTop = Canvas.GetTop(scrollThumb);
-            if (double.IsNaN(thumbDragStartTop)) thumbDragStartTop = 0;
+            thumbDragStartTop = scrollThumbTop;
             e.Handled = true;
         };
         scrollThumb.PointerMoved += (_, e) =>
@@ -3700,14 +3719,17 @@ public sealed partial class MainWindow : Window
             if (writing) _lastPenActivity = DateTimeOffset.UtcNow;
             _setPageScrollLocked?.Invoke(writing);
             _activeInk = ink;
-            RefreshHistoryActions();
+            // A stroke is not added to history until pen-up. Refreshing here briefly paints
+            // undo/redo from that intermediate state, which makes the buttons flash while
+            // writing. InkChanged/HistoryChanged refresh them when the stroke is committed.
             if (_floatingToolbar is not null) _floatingToolbar.Visibility = Visibility.Visible;
         };
         ink.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, _) =>
         {
             _activeInk = ink;
             RefreshSelectionAction();
-            RefreshHistoryActions();
+            // Pointer-down does not change history; preserve the current button state until
+            // the interaction actually commits an edit.
             if (_pageTypeButton is not null) _pageTypeButton.Content = ink.Page.PaperStyle.ToString();
         }), true);
         return ink;
@@ -5117,6 +5139,7 @@ public sealed partial class MainWindow : Window
         public TextBlock PageNumber { get { EnsureVisual(); return _pageNumber!; } }
         private Task? _inkLoadTask;
         public bool InkLoaded { get; private set; }
+        public bool InkLoadStarted => _inkLoadTask is not null;
         public bool LoadAttemptCompleted { get; private set; }
         public bool IsPresented { get; private set; }
         public event EventHandler? ContentReady;
@@ -5144,7 +5167,7 @@ public sealed partial class MainWindow : Window
                 Height = window._pageViewportHeight > 0 ? window._pageViewportHeight : double.NaN,
                 Background = Brush("#0A0A09")
             };
-            _autosave = new DebouncedAutosave(() => SaveAsync());
+            _autosave = new DebouncedAutosave(() => SaveAsync(deferWhileWriting: true));
             _root.Loaded += async (_, _) =>
             {
                 try { await EnsureInkLoadedAsync(); }
@@ -5207,13 +5230,18 @@ public sealed partial class MainWindow : Window
             {
                 if (!_modelAlreadyLoaded)
                 {
-                    // Ink and photo metadata are independent local files. Load them concurrently
-                    // off the UI path, then build the WinUI geometry once both models are ready.
-                    var strokesTask = InkFileService.LoadAsync(Page.Id);
-                    var photosTask = PhotoFileService.LoadAsync(Page.Id);
-                    await Task.WhenAll(strokesTask, photosTask);
-                    Page.Strokes = await strokesTask;
-                    Page.Photos = await photosTask;
+                    // Large handwriting JSON can contain tens of thousands of points. Parse both
+                    // page assets on the thread pool so a page entering the realization cache does
+                    // not pause the ScrollViewer's UI thread mid-gesture.
+                    var model = await Task.Run(async () =>
+                    {
+                        var strokesTask = InkFileService.LoadAsync(Page.Id);
+                        var photosTask = PhotoFileService.LoadAsync(Page.Id);
+                        await Task.WhenAll(strokesTask, photosTask).ConfigureAwait(false);
+                        return (Strokes: await strokesTask.ConfigureAwait(false), Photos: await photosTask.ConfigureAwait(false));
+                    });
+                    Page.Strokes = model.Strokes;
+                    Page.Photos = model.Photos;
                     TraceNotebookOpen($"page {Page.SortOrder + 1}: files parsed ({Page.Strokes.Count} strokes, {Page.Photos.Count} photos)");
                 }
 
@@ -5242,15 +5270,23 @@ public sealed partial class MainWindow : Window
             }
         }
         public void Dirty() { Page.ModifiedAt = DateTimeOffset.Now; ++_dirtyRevision; _autosave.Request(); }
-        private async Task SaveAsync()
+        private async Task SaveAsync(bool deferWhileWriting)
         {
             var revision = _dirtyRevision;
             if (revision == _savedRevision) return;
+            if (deferWhileWriting && Ink?.IsWriting == true)
+            {
+                // Never snapshot/serialize a page while pointer samples are arriving. Apart from
+                // avoiding a UI-thread hitch, this ensures an in-progress stroke is not persisted
+                // in a partial state. Pen-up marks the page dirty and restarts the debounce.
+                _autosave.Request();
+                return;
+            }
             await _db.SavePageAsync(Page, InkLoaded);
             _savedRevision = revision;
             if (_dirtyRevision != revision) _autosave.Request();
         }
-        public Task FlushAsync(DatabaseService db) => SaveAsync();
+        public Task FlushAsync(DatabaseService db) => SaveAsync(deferWhileWriting: false);
         public void Dispose() => _autosave.Dispose();
     }
 

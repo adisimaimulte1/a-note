@@ -30,19 +30,28 @@ public static class InkFileService
     {
         // Autosave runs asynchronously while pen input continues. Serialize a stable deep
         // snapshot so a live List<T> mutation cannot invalidate the JSON enumerator.
-        var snapshot = strokes.Select(stroke => new InkStrokeData
+        var snapshot = new List<InkStrokeData>(strokes.Count);
+        foreach (var stroke in strokes)
         {
-            Id = stroke.Id,
-            Tool = stroke.Tool,
-            Color = stroke.Color,
-            Width = stroke.Width,
-            Points = stroke.Points.Select(point => new InkPointData
+            var points = new List<InkPointData>(stroke.Points.Count);
+            foreach (var point in stroke.Points)
             {
-                X = point.X,
-                Y = point.Y,
-                Pressure = point.Pressure
-            }).ToList()
-        }).ToList();
+                points.Add(new InkPointData
+                {
+                    X = point.X,
+                    Y = point.Y,
+                    Pressure = point.Pressure
+                });
+            }
+            snapshot.Add(new InkStrokeData
+            {
+                Id = stroke.Id,
+                Tool = stroke.Tool,
+                Color = stroke.Color,
+                Width = stroke.Width,
+                Points = points
+            });
+        }
         AppPaths.EnsureCreated();
         var target = AppPaths.InkPath(pageId);
         var temp = target + ".tmp";
